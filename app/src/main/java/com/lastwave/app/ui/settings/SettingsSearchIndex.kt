@@ -208,6 +208,20 @@ object SettingsSearchIndex {
             )
             add(
                 SettingsEntry(
+                    id = "audio.neuralmix",
+                    title = "NeuralMix",
+                    subtitle = "Adaptive mixing development preview",
+                    keywords = listOf("neuralmix", "adaptive", "dj", "transition"),
+                    icon = Icons.Filled.Bolt,
+                    iconContainer = { MaterialTheme.colorScheme.primaryContainer },
+                    iconTint = { MaterialTheme.colorScheme.onPrimaryContainer },
+                    parentTab = SettingsTab.AUDIO,
+                    section = "Audio & Playback",
+                    type = EntryType.TOGGLE,
+                )
+            )
+            add(
+                SettingsEntry(
                     id = "audio.crossfade",
                     title = "Crossfade",
                     subtitle = "Blend the end of a track smoothly into the next one",

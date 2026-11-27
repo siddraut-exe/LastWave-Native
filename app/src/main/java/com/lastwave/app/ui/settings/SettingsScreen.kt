@@ -402,6 +402,7 @@ fun SettingsScreen(
     val avatarUrl by viewModel.avatarUrl.collectAsStateWithLifecycle()
     val theme by viewModel.theme.collectAsStateWithLifecycle()
     val misc by viewModel.misc.collectAsStateWithLifecycle()
+    val mixingConflict by viewModel.mixingConflict.collectAsStateWithLifecycle()
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val downloadCount by viewModel.downloadCount.collectAsStateWithLifecycle()
     val downloadTotalBytes by viewModel.downloadTotalBytes.collectAsStateWithLifecycle()
@@ -921,6 +922,23 @@ fun SettingsScreen(
                                     position = position,
                                 )
                             }
+                        }
+                        add { position ->
+                            SettingsToggleCard(
+                                icon = QualityGlyphs.AutoMix,
+                                iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                title = "NeuralMix",
+                                subtitle = when {
+                                    misc.isBitPerfectEnabled -> "Unavailable while Bit-Perfect is enabled"
+                                    hfSettings.neuralMixEnabled -> "Selected • Preview only; mixing engine pending"
+                                    else -> "Adaptive mixing • Development preview"
+                                },
+                                checked = hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled,
+                                onCheckedChange = viewModel::setNeuralMixEnabled,
+                                position = position,
+                                isHighlighted = highlightedSettingId == "audio.neuralmix",
+                            )
                         }
                         add { position ->
                             SettingsToggleCard(
@@ -2403,6 +2421,15 @@ fun SettingsScreen(
     // -- Custom color wheel dialog (par 8.4) --
     if (state.showColorWheel) {
         ColorWheelSheet(onDismiss = viewModel::dismissColorWheel, onApply = viewModel::applyCustomColor)
+    }
+
+    mixingConflict?.let { message ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissMixingConflict,
+            title = { Text("Audio mode conflict") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = viewModel::dismissMixingConflict) { Text("Understood") } },
+        )
     }
 
     // -- Clear-all-data confirm --

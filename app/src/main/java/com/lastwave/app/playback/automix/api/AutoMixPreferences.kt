@@ -29,6 +29,7 @@ data class AutoMixSettings(
     val targetDurationSeconds: Int = 12, // 12s..30s, default 12s
     val spectralFilterSweepsEnabled: Boolean = true,
     val thermalProfile: ThermalProfile = ThermalProfile.BALANCED,
+    val neuralMixEnabled: Boolean = false,
 )
 
 internal val Context.autoMixDataStore by preferencesDataStore(name = "automix_prefs")
@@ -38,6 +39,7 @@ class AutoMixPreferences @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
     private object Keys {
+        val NEURAL_ENABLED = booleanPreferencesKey("neuralmix_enabled")
         val ENABLED = booleanPreferencesKey("automix_enabled")
         val LEGACY_ENABLED = booleanPreferencesKey("harmonic_flow_enabled")
         val DURATION_MODE = stringPreferencesKey("automix_duration_mode")
@@ -58,7 +60,8 @@ class AutoMixPreferences @Inject constructor(
         val isEnabled = prefs[Keys.ENABLED] ?: prefs[Keys.LEGACY_ENABLED] ?: false
 
         AutoMixSettings(
-            autoMixEnabled = isEnabled,
+            autoMixEnabled = isEnabled && prefs[Keys.NEURAL_ENABLED] != true,
+            neuralMixEnabled = prefs[Keys.NEURAL_ENABLED] ?: false,
             durationMode = mode,
             targetDurationSeconds = (prefs[Keys.TARGET_SECONDS] ?: 12).coerceIn(12, 30),
             spectralFilterSweepsEnabled = prefs[Keys.SPECTRAL_SWEEPS] ?: true,
@@ -68,8 +71,19 @@ class AutoMixPreferences @Inject constructor(
 
     suspend fun setAutoMixEnabled(enabled: Boolean) {
         context.autoMixDataStore.edit {
-            it[Keys.ENABLED] = enabled
-            it[Keys.LEGACY_ENABLED] = enabled
+            val allowed = enabled && it[Keys.NEURAL_ENABLED] != true
+            it[Keys.ENABLED] = allowed
+            it[Keys.LEGACY_ENABLED] = allowed
+        }
+    }
+
+    suspend fun setNeuralMixEnabled(enabled: Boolean) {
+        context.autoMixDataStore.edit {
+            it[Keys.NEURAL_ENABLED] = enabled
+            if (enabled) {
+                it[Keys.ENABLED] = false
+                it[Keys.LEGACY_ENABLED] = false
+            }
         }
     }
 

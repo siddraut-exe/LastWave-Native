@@ -38,6 +38,9 @@ import com.lastwave.app.util.FileExportHelper
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
@@ -615,8 +618,18 @@ class SettingsViewModel @Inject constructor(
             }
         }
     }
+    private val mixingModeLock = Mutex()
+    private val _mixingConflict = MutableStateFlow<String?>(null)
+    val mixingConflict = _mixingConflict.asStateFlow()
+    fun dismissMixingConflict() { _mixingConflict.value = null }
+
     fun setBitPerfectEnabled(enabled: Boolean) {
         launchSettingsAction("update Bit-Perfect mode") {
+            mixingModeLock.withLock {
+            if (enabled && autoMixPreferences.settings.first().neuralMixEnabled) {
+                autoMixPreferences.setNeuralMixEnabled(false)
+                _mixingConflict.value = "NeuralMix has been disabled to preserve Bit-Perfect playback."
+            }
             applyNativeAudio { it.setBitPerfect(enabled) }
             settingsPreferences.setBitPerfectEnabled(enabled)
             com.lastwave.app.playback.usb.UsbExclusivePrefs.setEnabled(context, enabled)
@@ -624,6 +637,7 @@ class SettingsViewModel @Inject constructor(
                 // When Bit-Perfect is turned on, automatically turn off Studio Master Clarity
                 settingsPreferences.setStudioMasterClarity(false)
                 applyNativeAudio { it.setStudioMasterClarity(false) }
+            }
             }
         }
     }
@@ -800,8 +814,30 @@ class SettingsViewModel @Inject constructor(
         )
 
     fun setAutoMixEnabled(enabled: Boolean) = launchSettingsAction("update automix enabled") {
-        autoMixPreferences.setAutoMixEnabled(enabled)
-        if (enabled) settingsPreferences.setCrossfadeEnabled(false)
+        mixingModeLock.withLock {
+            if (enabled && autoMixPreferences.settings.first().neuralMixEnabled) {
+                _mixingConflict.value = "AutoMix and NeuralMix cannot operate simultaneously. NeuralMix remains selected."
+            } else {
+                autoMixPreferences.setAutoMixEnabled(enabled)
+                if (enabled) settingsPreferences.setCrossfadeEnabled(false)
+            }
+        }
+    }
+
+    fun setNeuralMixEnabled(enabled: Boolean) = launchSettingsAction("update NeuralMix") {
+        mixingModeLock.withLock {
+            val misc = settingsPreferences.settings.first()
+            val mix = autoMixPreferences.settings.first()
+            if (enabled && misc.isBitPerfectEnabled) {
+                _mixingConflict.value = "Disable Bit-Perfect before enabling NeuralMix."
+            } else {
+                if (enabled) settingsPreferences.setCrossfadeEnabled(false)
+                autoMixPreferences.setNeuralMixEnabled(enabled)
+                if (enabled && (mix.autoMixEnabled || misc.crossfadeEnabled)) {
+                    _mixingConflict.value = "AutoMix and Crossfade cannot operate with NeuralMix. Conflicting modes have been disabled."
+                }
+            }
+        }
     }
 
     fun setAutoMixDurationMode(mode: com.lastwave.app.playback.automix.api.TransitionDurationMode) =
@@ -828,8 +864,14 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setCrossfadeEnabled(enabled: Boolean) = launchSettingsAction("update crossfade") {
-        settingsPreferences.setCrossfadeEnabled(enabled)
-        if (enabled) autoMixPreferences.setAutoMixEnabled(false)
+        mixingModeLock.withLock {
+            if (enabled && autoMixPreferences.settings.first().neuralMixEnabled) {
+                _mixingConflict.value = "Crossfade cannot operate with NeuralMix."
+            } else {
+                settingsPreferences.setCrossfadeEnabled(enabled)
+                if (enabled) autoMixPreferences.setAutoMixEnabled(false)
+            }
+        }
     }
     fun setCrossfadeSeconds(seconds: Int) = launchSettingsAction("update crossfade duration") {
         settingsPreferences.setCrossfadeSeconds(seconds.coerceIn(1, 12))

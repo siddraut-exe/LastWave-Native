@@ -310,6 +310,15 @@ android {
     }
 
     signingConfigs {
+        getByName("debug") {
+            System.getenv("NEURALMIX_KEYSTORE_PATH")?.let { path ->
+                storeFile = file(path)
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+                storeType = "JKS"
+            }
+        }
         create("release_config") {
             if (releaseKeystoreFile != null && releaseKeystoreFile.exists() && storePasswordProp.isNotBlank()) {
                 storeFile = releaseKeystoreFile

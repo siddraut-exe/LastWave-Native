@@ -61,6 +61,8 @@ jobs:
           mkdir -p "$HOME/.android"
           printf '%s' "$DEBUG_KEYSTORE" | base64 --decode > "$HOME/.android/debug.keystore"
           chmod 600 "$HOME/.android/debug.keystore"
+          echo "NEURALMIX_KEYSTORE_PATH=$HOME/.android/debug.keystore" >> "$GITHUB_ENV"
+
 
       - name: Build Debug APK
         run: |
@@ -68,6 +70,18 @@ jobs:
             --no-daemon \
             --max-workers=2 \
             --stacktrace
+
+      - name: Verify NeuralMix signing certificate
+        run: |
+          EXPECTED="4a17eae1e9bb632d25acc7e5145ca7ef1f50b862ef784ceb0d22370e7057cccd"
+          ACTUAL=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | awk '/certificate SHA-256 digest:/ {print $NF}')
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: NeuralMix signing certificate mismatch"
+            exit 1
+          fi
+          echo "Persistent signing verified successfully."
 
       - name: Prepare APK artifact
         run: |

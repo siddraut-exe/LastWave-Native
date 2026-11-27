@@ -10,7 +10,7 @@ import java.io.File
 import java.security.MessageDigest
 
 /** Bump when analysis output changes meaning: older files are then ignored, never misread. */
-const val ANALYSIS_VERSION = 3
+const val ANALYSIS_VERSION = 4
 
 @Serializable
 data class VocalSpan(val startMs: Long, val endMs: Long)
@@ -40,25 +40,38 @@ data class AcousticSignature(
 /** Memory LRU over one small JSON file per stream, so a song is decoded once, not every play. */
 class AcousticSignatureStore(private val directory: File) {
     private val memory = LruCache<String, AcousticSignature>(64)
-    private val json = Json { ignoreUnknownKeys = true }
+    private val missing = LruCache<String, Boolean>(256)
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+    @Synchronized
     fun get(key: String): AcousticSignature? {
-        synchronized(memory) { memory.get(key) }?.let { return it }
+        memory.get(key)?.let { return it }
+        if (missing.get(key) == true) return null
         val file = fileFor(key)
-        if (!file.isFile) return null
-        val loaded = runCatching { json.decodeFromString<AcousticSignature>(file.readText()) }
-            .getOrNull()
-            ?.takeIf { it.version == ANALYSIS_VERSION && it.key == key }
-            ?: return null
-        synchronized(memory) { memory.put(key, loaded) }
+        val loaded = if (file.isFile) runCatching {
+            val raw = file.readText()
+            val obj = json.parseToJsonElement(raw) as? kotlinx.serialization.json.JsonObject
+            // Older versions omitted the default version field. Do not decode
+            // those using today's default, which silently mislabels old data.
+            val version = obj?.get("version") as? kotlinx.serialization.json.JsonPrimitive
+            if (version?.content != ANALYSIS_VERSION.toString()) null
+            else json.decodeFromString<AcousticSignature>(raw)
+        }.getOrNull()?.takeIf { it.version == ANALYSIS_VERSION && it.key == key } else null
+        if (loaded == null) missing.put(key, true) else memory.put(key, loaded)
         return loaded
     }
 
     fun put(signature: AcousticSignature) {
-        synchronized(memory) { memory.put(signature.key, signature) }
+        synchronized(this) {
+            memory.put(signature.key, signature)
+            missing.remove(signature.key)
+        }
         runCatching {
             directory.mkdirs()
-            fileFor(signature.key).writeText(json.encodeToString(signature))
+            val file = fileFor(signature.key)
+            val temp = File(directory, file.name + ".tmp")
+            temp.writeText(json.encodeToString(signature))
+            check(temp.renameTo(file)) { "Could not replace acoustic cache entry" }
         }.onFailure { Log.w(TAG, "Could not persist analysis for ${signature.key}", it) }
     }
 

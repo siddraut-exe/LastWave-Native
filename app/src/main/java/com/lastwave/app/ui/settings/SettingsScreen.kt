@@ -453,6 +453,9 @@ fun SettingsScreen(
     var showDownloadQualityDialog by remember { mutableStateOf(false) }
     var showHiResStartDialog by remember { mutableStateOf(false) }
     var showEqSheet by remember { mutableStateOf(false) }
+    var showNeuralSheet by remember { mutableStateOf(false) }
+    var showNeuralQuality by remember { mutableStateOf(false) }
+    val hfSettings by viewModel.autoMixSettings.collectAsStateWithLifecycle()
     var showAutoEq by remember { mutableStateOf(false) }
     var showSeekbarStyleDialog by remember { mutableStateOf(false) }
     var showLyricsProviderDialog by remember { mutableStateOf(false) }
@@ -891,7 +894,6 @@ fun SettingsScreen(
                                 isHighlighted = (highlightedSettingId == "audio.bit_perfect"),
                             )
                         }
-                        val hfSettings by viewModel.autoMixSettings.collectAsStateWithLifecycle()
                         add { position ->
                             SettingsToggleCard(
                                 icon = QualityGlyphs.AutoMix,
@@ -935,60 +937,23 @@ fun SettingsScreen(
                                     else -> "Adaptive mixing • Experimental"
                                 },
                                 checked = hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled,
-                                onCheckedChange = viewModel::setNeuralMixEnabled,
+                                onCheckedChange = { enabled ->
+                                    viewModel.setNeuralMixEnabled(enabled)
+                                    showNeuralSheet = enabled && !misc.isBitPerfectEnabled
+                                },
                                 position = position,
                                 isHighlighted = highlightedSettingId == "audio.neuralmix",
                             )
                         }
                         if (hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled) {
                             add { position ->
-                                SettingsToggleCard(
-                                    icon = QualityGlyphs.AutoMix,
-                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
-                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    title = "Intelligent DJ",
-                                    subtitle = "Prefer compatible analysed tracks in automatic radio batches",
-                                    checked = hfSettings.intelligentDjEnabled,
-                                    onCheckedChange = viewModel::setIntelligentDjEnabled,
-                                    position = position,
-                                )
-                            }
-                            add { position ->
-                                SettingsToggleCard(
-                                    icon = QualityGlyphs.AutoMix,
-                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
-                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    title = "Smart bass exchange",
-                                    subtitle = "Reduce bass overlap during NeuralMix transitions",
-                                    checked = hfSettings.neuralBass,
-                                    onCheckedChange = viewModel::setNeuralBass,
-                                    position = position,
-                                )
-                            }
-                            add { position ->
-                                SettingsToggleCard(
-                                    icon = QualityGlyphs.AutoMix,
-                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
-                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    title = "Vocal protection",
-                                    subtitle = "Use synced lyrics to avoid overlapping vocal lines",
-                                    checked = hfSettings.neuralVocals,
-                                    onCheckedChange = viewModel::setNeuralVocals,
-                                    position = position,
-                                )
-                            }
-                            add { position ->
                                 SettingsActionCard(
                                     icon = QualityGlyphs.AutoMix,
                                     iconContainer = MaterialTheme.colorScheme.primaryContainer,
                                     iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    title = "DJ analysis quality",
-                                    subtitle = when (hfSettings.neuralQuality.name) {
-                                        "ECO" -> "Efficient • Cached candidates only"
-                                        "PERFORMANCE" -> "Maximum • Up to 3 fresh candidates"
-                                        else -> "Balanced • Up to 1 fresh candidate"
-                                    },
-                                    onClick = { viewModel.cycleNeuralQuality() },
+                                    title = "NeuralMix settings",
+                                    subtitle = "Intelligent DJ, bass, vocals and analysis quality",
+                                    onClick = { showNeuralSheet = true },
                                     position = position,
                                 )
                             }
@@ -2792,6 +2757,58 @@ fun SettingsScreen(
         )
     }
 
+    // Match the Equalizer's native sheet navigation rather than cycling a hidden value.
+    if (showNeuralSheet && hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled && mixingConflict == null) {
+        ModalBottomSheet(
+            onDismissRequest = { showNeuralSheet = false; showNeuralQuality = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 32.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(if (showNeuralQuality) "DJ analysis quality" else "NeuralMix", style = MaterialTheme.typography.headlineSmall)
+                if (showNeuralQuality) {
+                    com.lastwave.app.playback.automix.api.ThermalProfile.entries.forEach { profile ->
+                        val (name, description) = when (profile) {
+                            com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> "Efficient" to "Analyze up to 3 upcoming tracks, one at a time."
+                            com.lastwave.app.playback.automix.api.ThermalProfile.BALANCED -> "Balanced" to "Analyze up to 5 upcoming tracks, one at a time."
+                            com.lastwave.app.playback.automix.api.ThermalProfile.PERFORMANCE -> "Maximum" to "Analyze up to 8 upcoming tracks within the available time."
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable { viewModel.setNeuralQuality(profile) }.padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = hfSettings.neuralQuality == profile, onClick = { viewModel.setNeuralQuality(profile) })
+                            Column(Modifier.weight(1f)) {
+                                Text(name, style = MaterialTheme.typography.titleMedium)
+                                Text(description, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                    TextButton(onClick = { showNeuralQuality = false }) { Text("Back to NeuralMix") }
+                } else {
+                    NeuralMixSheetToggle("Intelligent DJ", "At mid-playback, compare upcoming radio tracks and promote a compatible next track. Manual queues are protected.", hfSettings.intelligentDjEnabled, viewModel::setIntelligentDjEnabled)
+                    NeuralMixSheetToggle("Smart bass exchange", "Reduce bass overlap during NeuralMix transitions.", hfSettings.neuralBass, viewModel::setNeuralBass)
+                    NeuralMixSheetToggle("Vocal protection", "Use synced lyrics to reduce overlapping vocal lines when available.", hfSettings.neuralVocals, viewModel::setNeuralVocals)
+                    SettingsActionCard(
+                        icon = QualityGlyphs.AutoMix,
+                        iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                        iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        title = "DJ analysis quality",
+                        subtitle = when (hfSettings.neuralQuality.name) {
+                            "ECO" -> "Efficient"
+                            "PERFORMANCE" -> "Maximum"
+                            else -> "Balanced"
+                        },
+                        onClick = { showNeuralQuality = true },
+                    )
+                    Text("Analysis runs in the background. Unsupported streams or uncertain rhythms use a conservative fade.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+
     // -- Experimental 15-band equalizer --
     if (showEqSheet) {
         EqualizerSheet(
@@ -3475,5 +3492,16 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun NeuralMixSheetToggle(title: String, description: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }

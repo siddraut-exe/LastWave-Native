@@ -10,6 +10,8 @@ object SignatureCompatibility {
         val aKey = outgoing.outro?.takeIf { it.keyConfidence >= 0.5f }?.camelotKey
         val bKey = incoming.intro?.takeIf { it.keyConfidence >= 0.5f }?.camelotKey
         // Vocal overlap depends on the actual cue points, not the whole windows.
-        return NeuralMixRanker.compare(a, b, aKey, bKey)
+        return NeuralMixRanker.compare(a, b, aKey, bKey,
+            allowBarRotation = (outgoing.outro?.grid?.barConfidence ?: 0f) < 0.5f ||
+                (incoming.intro?.grid?.barConfidence ?: 0f) < 0.5f)
     }
 }

@@ -842,9 +842,8 @@ class SettingsViewModel @Inject constructor(
 
     fun setNeuralBass(enabled: Boolean) = launchSettingsAction("update NeuralMix bass") { autoMixPreferences.setNeuralBass(enabled) }
     fun setNeuralVocals(enabled: Boolean) = launchSettingsAction("update NeuralMix vocals") { autoMixPreferences.setNeuralVocals(enabled) }
-    fun cycleNeuralQuality() = launchSettingsAction("update NeuralMix quality") {
-        val values = com.lastwave.app.playback.automix.api.ThermalProfile.entries
-        autoMixPreferences.setNeuralQuality(values[(autoMixSettings.value.neuralQuality.ordinal + 1) % values.size])
+    fun setNeuralQuality(value: com.lastwave.app.playback.automix.api.ThermalProfile) = launchSettingsAction("update NeuralMix quality") {
+        autoMixPreferences.setNeuralQuality(value)
     }
 
     fun setIntelligentDjEnabled(enabled: Boolean) = launchSettingsAction("update Intelligent DJ") {

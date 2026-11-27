@@ -14,6 +14,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import android.os.SystemClock
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -41,37 +44,105 @@ class AcousticSignatureExtractor @Inject constructor(
         }.asCoroutineDispatcher(),
     )
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
-    private val failed = ConcurrentHashMap.newKeySet<String>()
+    private val failed = ConcurrentHashMap<String, Long>()
+    private val decodeLock = Mutex()
+
+    private fun recentlyFailed(key: String): Boolean {
+        val time = failed[key] ?: return false
+        if (SystemClock.elapsedRealtime() - time < FAILURE_RETRY_MS) return true
+        failed.remove(key, time)
+        return false
+    }
+
+    private fun introKey(key: String): String = "$key|neuralmix-intro"
 
     fun signature(key: String): AcousticSignature? = store.get(key)
 
-    /** True once [key] is analysed or has failed; false while pending or never requested. */
-    fun isSettled(key: String): Boolean = key in failed || store.get(key) != null
+    /** A candidate needs only its intro; keep that cache separate from a full signature. */
+    fun incomingSignature(key: String): AcousticSignature? =
+        signature(key)?.takeIf { it.intro != null } ?: store.get(introKey(key))
 
-    fun request(key: String, track: PlayableTrack, input: AnalysisInput) {
-        if (key in failed || key in inFlight || store.get(key) != null) return
-        if (!inFlight.add(key)) return
+    fun status(key: String, introOnly: Boolean = false): String {
+        val storageKey = if (introOnly) introKey(key) else key
+        val available = if (introOnly) incomingSignature(key) else signature(key)
+        return when {
+            available != null -> "available"
+            storageKey in inFlight || (introOnly && key in inFlight) -> "pending"
+            recentlyFailed(storageKey) || (introOnly && recentlyFailed(key)) -> "decode failed / retry cooldown"
+            else -> "not requested or unsupported input"
+        }
+    }
+
+    /** True once [key] is analysed or has failed; false while pending or never requested. */
+    fun isSettled(key: String): Boolean = recentlyFailed(key) || signature(key) != null
+    fun isIntroSettled(key: String): Boolean = incomingSignature(key) != null || recentlyFailed(introKey(key)) ||
+        (key !in inFlight && recentlyFailed(key))
+
+    fun request(key: String, track: PlayableTrack, input: AnalysisInput) =
+        requestInternal(key, track, input, introOnly = false)
+
+    fun requestIntro(key: String, track: PlayableTrack, input: AnalysisInput) =
+        requestInternal(key, track, input, introOnly = true)
+
+    private fun requestInternal(key: String, track: PlayableTrack, input: AnalysisInput, introOnly: Boolean) {
+        val storageKey = if (introOnly) introKey(key) else key
+        if (introOnly && (incomingSignature(key) != null || key in inFlight)) return
+        if (recentlyFailed(storageKey) || storageKey in inFlight || store.get(storageKey) != null) return
+        if (!inFlight.add(storageKey)) return
         scope.launch {
             try {
-                val signature = withTimeoutOrNull(ANALYSIS_TIMEOUT_MS) { analyze(key, track, input) }
-                if (signature != null) store.put(signature) else failed += key
-            } catch (error: Throwable) {
+                val signature = decodeLock.withLock {
+                    // Full analysis can reuse the intro once an in-flight candidate finishes.
+                    val cached = incomingSignature(key)
+                    if (introOnly && cached != null) cached.copy(key = storageKey, outro = null, outroRhythm = null)
+                    else withTimeoutOrNull(ANALYSIS_TIMEOUT_MS) { analyze(storageKey, input, track, introOnly, cached) }
+                }
+                if (signature != null) {
+                    val vocals = signature.vocals ?: withTimeoutOrNull(3_000L) { vocalSpans(track, signature.durationMs) }
+                    val complete = signature.copy(vocals = vocals)
+                    if (!introOnly && complete.outro == null) {
+                        // Preserve a useful intro, but allow a later outro retry.
+                        if (complete.intro != null) store.put(complete.copy(key = introKey(key)))
+                        failed[storageKey] = SystemClock.elapsedRealtime()
+                    } else if (introOnly && complete.intro == null) {
+                        failed[storageKey] = SystemClock.elapsedRealtime()
+                    } else {
+                        store.put(complete)
+                        failed.remove(storageKey)
+                    }
+                } else {
+                    failed[storageKey] = SystemClock.elapsedRealtime()
+                    Log.w(TAG, "No acoustic signature for '${track.title}' (timeout or empty PCM, introOnly=$introOnly)")
+                }
+            } catch (error: Exception) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
                 Log.w(TAG, "Analysis failed for '${track.title}'", error)
-                failed += key
+                failed[storageKey] = SystemClock.elapsedRealtime()
             } finally {
-                inFlight -= key
+                inFlight -= storageKey
             }
         }
     }
 
-    private suspend fun analyze(key: String, track: PlayableTrack, input: AnalysisInput): AcousticSignature? {
+    private suspend fun analyze(key: String, input: AnalysisInput, track: PlayableTrack, introOnly: Boolean, cachedIntro: AcousticSignature?): AcousticSignature? {
         val started = System.currentTimeMillis()
         val signature = PcmWindowDecoder(input).use { decoder ->
             val durationMs = decoder.durationMs.takeIf { it > 0L } ?: track.durationMs ?: return null
-            val intro = decoder.decode(0L, WINDOW_MS)?.let(::analyzeWindow)
+            if (durationMs <= 0L) return null
+            suspend fun window(startMs: Long): Pair<WindowAnalysis, RhythmFingerprint?>? = try {
+                withTimeoutOrNull(WINDOW_TIMEOUT_MS) { decoder.decode(startMs, WINDOW_MS)?.let(::analyzeWindow) }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "PCM window at ${startMs}ms failed for '${track.title}'", error)
+                null
+            }
+            // Exact stream identity is already checked by the cache key. A changed
+            // decoded duration indicates a different edit; don't reuse its intro.
+            val cached = cachedIntro?.takeIf { kotlin.math.abs(it.durationMs - durationMs) < 500L }
+            val intro = cached?.intro?.let { it to cached.introRhythm } ?: window(0L)
             val outroStart = (durationMs - WINDOW_MS).coerceAtLeast(0L)
-            val outro = decoder.decode(outroStart, WINDOW_MS)?.let(::analyzeWindow)
+            val outro = if (introOnly) null else if (outroStart == 0L) intro else window(outroStart)
             if (intro == null && outro == null) return null
             AcousticSignature(
                 key = key,
@@ -80,22 +151,19 @@ class AcousticSignatureExtractor @Inject constructor(
                 outro = outro?.first,
                 introRhythm = intro?.second,
                 outroRhythm = outro?.second,
-                vocals = vocalSpans(track, durationMs),
+                vocals = cached?.vocals,
             )
         }
-        Log.i(
-            TAG,
-            "'${track.title}' in ${System.currentTimeMillis() - started}ms: " +
-                "intro=${signature.intro?.describe()} outro=${signature.outro?.describe()} " +
-                "vocals=${signature.vocals?.size ?: "unknown"}",
-        )
+        Log.i(TAG, "'${track.title}' in ${System.currentTimeMillis() - started}ms: introOnly=$introOnly " +
+            "intro=${signature.intro?.describe()} outro=${signature.outro?.describe()} " +
+            "introRhythm=${signature.introRhythm != null} outroRhythm=${signature.outroRhythm != null}")
         return signature
     }
 
     private fun analyzeWindow(window: PcmWindowDecoder.Window): Pair<WindowAnalysis, RhythmFingerprint?> {
         val analysis = TrackAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs)
         val grid = analysis.grid
-        val fingerprint = if (grid != null && grid.confidence >= 0.6f && grid.barConfidence >= 0.5f) {
+        val fingerprint = if (grid != null && grid.confidence >= 0.6f) {
             BeatSynchronousAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs, grid.downbeatMs, grid.bpm.toDouble())
         } else null
         return analysis to fingerprint
@@ -111,7 +179,7 @@ class AcousticSignatureExtractor @Inject constructor(
                 durationSeconds = (durationMs / 1000).toInt(),
                 videoId = track.videoId,
             )
-        }.getOrNull() as? LyricsResult.Success ?: return null
+        }.onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }.getOrNull() as? LyricsResult.Success ?: return null
         if (!lyrics.isSynced) return null
         val lines = lyrics.lines.filter { it.text.isNotBlank() }.sortedBy { it.timeMs }
         return lines.mapIndexed { index, line ->
@@ -131,6 +199,8 @@ class AcousticSignatureExtractor @Inject constructor(
     companion object {
         const val WINDOW_MS = 40_000L
         private const val ANALYSIS_TIMEOUT_MS = 30_000L
+        private const val WINDOW_TIMEOUT_MS = 14_000L
+        private const val FAILURE_RETRY_MS = 60_000L
         private const val MAX_LINE_MS = 6_000L
         private const val DEFAULT_LINE_MS = 3_500L
         private const val TAG = "AutoMixAnalysis"

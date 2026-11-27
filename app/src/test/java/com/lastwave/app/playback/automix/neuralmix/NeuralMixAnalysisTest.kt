@@ -38,6 +38,15 @@ class NeuralMixAnalysisTest {
         assertTrue(aligned > shifted)
         assertNull(CueRhythm.compare(List(40) { 0 }, 0, 0.0, bands, 0, 0.0, 1.0, 2000.0))
     }
+    @Test fun uncertainBarPhaseAllowsWholeBeatRotationButNotOffbeatShift() {
+        val profile = List(16) { if (it == 0) 1.0 else if (it == 8) 0.4 else 0.0 }
+        val a = RhythmFingerprint(profile, profile, profile, 0.5, 120.0)
+        fun rotated(n: Int) = List(16) { profile[(it + n) % 16] }.let { a.copy(rhythm = it, bass = it, texture = it) }
+        val aligned = NeuralMixRanker.compare(a, rotated(4), allowBarRotation = true)
+        assertEquals(1.0, aligned.components.getValue("rhythm"), 0.001)
+        assertTrue(NeuralMixRanker.compare(a, rotated(1), allowBarRotation = true).score < aligned.score)
+        assertTrue(NeuralMixRanker.compare(a, rotated(4)).score < aligned.score)
+    }
     @Test fun silenceIsUnknown() {
         assertNull(BeatSynchronousAnalyzer.analyze(FloatArray(64000),8000,0.0,0.0,120.0))
     }

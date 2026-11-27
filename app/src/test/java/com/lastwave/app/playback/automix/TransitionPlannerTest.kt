@@ -129,6 +129,35 @@ class TransitionPlannerTest {
     }
 
     @Test
+    fun neuralMixRequiresEvidenceAndReportsFallbackReason() {
+        val settings = AutoMixSettings(neuralMixEnabled = true)
+        val missing = plan(outSig(beatOutro), inSig(beatIntro), settings) as MixPlan
+        assertFalse(missing.beatLocked)
+        assertNull(missing.neuralScore)
+        assertEquals("No reliable outro beat pattern", missing.neuralReason)
+        val rhythm = List(16) { if (it % 4 == 0) 1.0 else 0.1 }
+        val fingerprint = com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint(rhythm, rhythm, rhythm, 0.3, 124.0)
+        val out = outSig(beatOutro).copy(outroRhythm = fingerprint)
+        val inc = inSig(beatIntro).copy(introRhythm = fingerprint.copy(bpm = 126.0))
+        val compatible = plan(out, inc, settings) as MixPlan
+        assertTrue(compatible.beatLocked)
+        assertTrue(requireNotNull(compatible.neuralScore).score > 80.0)
+        val farTempo = inc.copy(intro = beatIntro.copy(grid = beatIntro.grid!!.copy(bpm = 170f)), introRhythm = fingerprint.copy(bpm = 170.0))
+        assertFalse((plan(out, farTempo, settings) as MixPlan).beatLocked)
+    }
+
+    @Test
+    fun neuralMixLimitsUncertainBarPhaseToShortPhrase() {
+        val rhythm = List(16) { if (it % 4 == 0) 1.0 else 0.1 }
+        val fingerprint = com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint(rhythm, rhythm, rhythm, 0.3, 124.0)
+        val out = outSig(beatOutro.copy(grid = beatOutro.grid!!.copy(barConfidence = 0.1f))).copy(outroRhythm = fingerprint)
+        val inc = inSig(beatIntro).copy(introRhythm = fingerprint.copy(bpm = 126.0))
+        val decision = plan(out, inc, AutoMixSettings(neuralMixEnabled = true)) as MixPlan
+        assertTrue(decision.beatLocked)
+        assertEquals(4, decision.bars)
+    }
+
+    @Test
     fun beatmix_needsTheUsersNormalSpeedAndCloseTempos() {
         assertFalse((plan(outSig(beatOutro), inSig(beatIntro), speed = 1.25f) as MixPlan).beatLocked)
         val farIntro = window(0, 40_000, bpm = 140f)

@@ -221,6 +221,7 @@ internal fun MusicPlayer.armCrossfadeStandby(nextIndex: Int, nextItem: MediaItem
         val isAlreadySet = standby.mediaItemCount == standbyQueue.size &&
             standby.currentMediaItemIndex == nextIndex &&
             standby.currentMediaItem?.mediaId == nextItem.mediaId &&
+            standby.currentMediaItem?.localConfiguration?.customCacheKey == nextItem.localConfiguration?.customCacheKey &&
             standby.playbackState != Player.STATE_IDLE
         if (!isAlreadySet) {
             standby.pause()

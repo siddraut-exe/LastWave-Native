@@ -7,7 +7,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.lastwave.app.playback.PlayableTrack
-import com.lastwave.app.playback.toMediaItem
+import com.lastwave.app.playback.toPlayableTrack
 import com.lastwave.app.playback.automix.analysis.AcousticSignatureExtractor
 import com.lastwave.app.playback.automix.analysis.AcousticSignature
 import com.lastwave.app.playback.automix.analysis.AnalysisInput
@@ -133,40 +133,37 @@ class DualDeckTransportCoordinator @Inject constructor(
 
     fun intelligentDjActive(): Boolean = settings.neuralMixEnabled && settings.intelligentDjEnabled && !bitPerfectRequested && !hardwareBypass && !jamActive
 
-    // A bounded session index of previously analysed renditions, not a guessed BPM.
-    private val recentAnalysisKeys = object : android.util.LruCache<String, String>(128) {}
-
     fun freshDjLimit(): Int = if (!intelligentDjActive()) 0 else when (settings.neuralQuality) {
-        com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> 0
-        com.lastwave.app.playback.automix.api.ThermalProfile.BALANCED -> 1
-        com.lastwave.app.playback.automix.api.ThermalProfile.PERFORMANCE -> 3
+        com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> 3
+        com.lastwave.app.playback.automix.api.ThermalProfile.BALANCED -> 5
+        com.lastwave.app.playback.automix.api.ThermalProfile.PERFORMANCE -> 8
     }
 
-    fun requestDjAnalysis(track: PlayableTrack, item: MediaItem, input: AnalysisInput): String? {
+    fun requestDjAnalysis(track: PlayableTrack, item: MediaItem, input: AnalysisInput, introOnly: Boolean = false): String? {
         if (!intelligentDjActive()) return null
         val key = analysisKey(item)
-        recentAnalysisKeys.put(item.mediaId, key)
-        analyzer.request(key, track, input)
+        if (introOnly) analyzer.requestIntro(key, track, input) else analyzer.request(key, track, input)
         return key
     }
 
-    fun djAnalysisSettled(key: String): Boolean = analyzer.isSettled(key)
+    fun djAnalysisSettled(key: String, introOnly: Boolean = false): Boolean =
+        if (introOnly) analyzer.isIntroSettled(key) else analyzer.isSettled(key)
+    fun djAnalysisStatus(key: String, introOnly: Boolean = false): String = analyzer.status(key, introOnly)
 
-    fun rankCachedRadio(outgoing: MediaItem, candidates: List<PlayableTrack>): List<PlayableTrack> {
-        val out = analyzer.signature(analysisKey(outgoing))
-            ?: recentAnalysisKeys.get(outgoing.mediaId)?.let(analyzer::signature) ?: return candidates
-        val shortlist = candidates.take(8)
-        val best = shortlist.mapIndexedNotNull { index, track ->
-            val item = track.toMediaItem()
-            val key = recentAnalysisKeys.get(item.mediaId) ?: analysisKey(item)
-            val incoming = analyzer.signature(key) ?: return@mapIndexedNotNull null
-            val score = com.lastwave.app.playback.automix.neuralmix.SignatureCompatibility.compare(out, incoming)
-                ?: return@mapIndexedNotNull null
-            if (com.lastwave.app.playback.automix.neuralmix.NeuralMixTransitionPolicy.maxBars(score) == 0) null
-            else index to (score.score * score.coverage)
-        }.maxByOrNull { it.second }?.first ?: return candidates
-        Log.i(TAG, "NeuralMix DJ promoted candidate ${best + 1} of ${shortlist.size}")
-        return listOf(candidates[best]) + candidates.filterIndexed { index, _ -> index != best }
+    /** Rank only a pair the real planner can actually beat-lock, using the analysed renditions. */
+    fun djCandidateScore(outgoing: MediaItem, incoming: MediaItem, durationMs: Long): Double? {
+        if (!intelligentDjActive()) return null
+        val out = analyzer.signature(analysisKey(outgoing)) ?: return null
+        val inc = analyzer.incomingSignature(analysisKey(incoming)) ?: return null
+        val decision = TransitionPlanner.plan(PlanInput(
+            outgoing = outgoing.toPlayableTrack(), incoming = incoming.toPlayableTrack(),
+            outgoingDurationMs = durationMs, incomingDurationMs = inc.durationMs,
+            outgoingSignature = out, incomingSignature = inc, settings = settings,
+            userSpeed = 1f, userPitch = 1f,
+        )) as? MixPlan ?: return null
+        val score = decision.neuralScore
+        Log.i(TAG, "NeuralMix DJ '${incoming.mediaMetadata.title}': ${decision.neuralReason}, score=${score?.score}, coverage=${score?.coverage}")
+        return if (decision.beatLocked && score != null) score.score * score.coverage else null
     }
 
     fun setBaseVolume(volume: Float) {
@@ -235,17 +232,16 @@ class DualDeckTransportCoordinator @Inject constructor(
         val remaining = tick.durationMs - tick.positionMs
         if (tick.positionMs < tick.durationMs / 4 && remaining > LOOK_AHEAD_MS) return
 
+        val neural = settings.neuralMixEnabled
         requestAnalysis(outKey, current, currentItem)
-        requestAnalysis(inKey, next, nextItem)
+        requestAnalysis(inKey, next, nextItem, introOnly = neural)
         val outSignature = analyzer.signature(outKey)
-        val inSignature = analyzer.signature(inKey)
-        if (outSignature != null) recentAnalysisKeys.put(currentItem.mediaId, outKey)
-        if (inSignature != null) recentAnalysisKeys.put(nextItem.mediaId, inKey)
+        val inSignature = if (neural) analyzer.incomingSignature(inKey) else analyzer.signature(inKey)
         // Mid-glide after a beatmix the deck runs at the matched tempo, not the user's.
         val userParameters = userParametersFor(tick.primary) ?: tick.primary.playbackParameters
         val inputs = "${outSignature != null}|${inSignature != null}|${tick.durationMs / 1_000}|" +
             "${userParameters.speed}|${userParameters.pitch}"
-        val settled = analyzer.isSettled(outKey) && analyzer.isSettled(inKey)
+        val settled = analyzer.isSettled(outKey) && (if (neural) analyzer.isIntroSettled(inKey) else analyzer.isSettled(inKey))
         if (inputs != decisionInputs && (settled || remaining <= DECIDE_BY_REMAINING_MS)) {
             decisionInputs = inputs
             decision = TransitionPlanner.plan(
@@ -260,7 +256,10 @@ class DualDeckTransportCoordinator @Inject constructor(
                     userSpeed = userParameters.speed,
                     userPitch = userParameters.pitch,
                 ),
-            ).also { logDecision(current, next, it) }
+            ).also {
+                logDecision(current, next, it)
+                if (settings.neuralMixEnabled) Log.i(TAG, "NeuralMix analysis: outgoing=${analyzer.status(outKey)} incoming=${analyzer.status(inKey, introOnly = neural)}")
+            }
             planContext = PlanContext(current, next, tick.durationMs, outSignature, inSignature)
             cuedStandbyFor = null
         }
@@ -268,7 +267,8 @@ class DualDeckTransportCoordinator @Inject constructor(
 
         val plan = decision as? MixPlan ?: return
         val standby = tick.standby ?: return
-        if (standby.currentMediaItem?.mediaId != nextItem.mediaId) return
+        if (standby.currentMediaItem?.mediaId != nextItem.mediaId ||
+            standby.currentMediaItem?.let { analysisKey(it) } != inKey) return
         val startIn = (plan.cueInMs - (if (plan.beatLocked) LOCK_LEAD_MS * plan.tempoRatio else 0f).toLong())
             .coerceAtLeast(0L)
         // Cue the standby while it is still idle so it is buffered at the cue point, not at 0:00.
@@ -304,6 +304,7 @@ class DualDeckTransportCoordinator @Inject constructor(
             style = com.lastwave.app.playback.automix.api.TransitionStyle.PERCEPTUAL_FADE,
             neuralMode = plan.neuralMode,
             neuralScore = plan.neuralScore,
+            neuralReason = if (plan.neuralMode) "Late start: shortened conservative fade" else null,
         )
         decision = late
         return late
@@ -515,10 +516,10 @@ class DualDeckTransportCoordinator @Inject constructor(
         runCatching { owned.first.playbackParameters = owned.second }
     }
 
-    private fun requestAnalysis(key: String, track: PlayableTrack, item: MediaItem) {
-        if (analyzer.isSettled(key)) return
+    private fun requestAnalysis(key: String, track: PlayableTrack, item: MediaItem, introOnly: Boolean = false) {
+        if (if (introOnly) analyzer.isIntroSettled(key) else analyzer.isSettled(key)) return
         val input = analysisInput?.invoke(item) ?: return
-        analyzer.request(key, track, input)
+        if (introOnly) analyzer.requestIntro(key, track, input) else analyzer.request(key, track, input)
     }
 
     private fun publishPlan(next: PlayableTrack) {
@@ -596,6 +597,7 @@ class DualDeckTransportCoordinator @Inject constructor(
             neuralScore = plan.neuralScore?.score,
             neuralCoverage = plan.neuralScore?.coverage,
             neuralComponents = plan.neuralScore?.components.orEmpty(),
+            neuralReason = plan.neuralReason,
         )
     }
 
@@ -610,7 +612,7 @@ class DualDeckTransportCoordinator @Inject constructor(
     private fun describe(plan: MixPlan) =
         "${plan.style} ${plan.shape} out=${plan.cueOutMs}ms in=${plan.cueInMs}ms len=${plan.overlapMs}ms " +
             "tempo=${plan.tempoRatio} bpm=${plan.bpm} keys=${plan.keyPair} bassSwap=${plan.bassSwapAtMs} " +
-            "vocalSafe=${plan.vocalSafe} neural=${plan.neuralMode} score=${plan.neuralScore?.score} coverage=${plan.neuralScore?.coverage}"
+            "vocalSafe=${plan.vocalSafe} neural=${plan.neuralMode} score=${plan.neuralScore?.score} coverage=${plan.neuralScore?.coverage} reason=${plan.neuralReason}"
 
     /**
      * Keeps the summed level on a straight line from the outgoing song's own

@@ -53,6 +53,7 @@ data class MixPlan(
     val bars: Int? = null,
     val neuralScore: com.lastwave.app.playback.automix.neuralmix.CompatibilityScore? = null,
     val neuralMode: Boolean = false,
+    val neuralReason: String? = null,
 ) : MixDecision {
     val endOutMs: Long get() = cueOutMs + overlapMs
 
@@ -109,10 +110,21 @@ object TransitionPlanner {
         val compatibility = if (neural) input.outgoingSignature?.let { out ->
             input.incomingSignature?.let { incoming -> SignatureCompatibility.compare(out, incoming) }
         } else null
-        val maxBars = if (neural) NeuralMixTransitionPolicy.maxBars(compatibility) else 16
+        val confidentBars = (outro?.grid?.barConfidence ?: 0f) >= 0.5f && (intro?.grid?.barConfidence ?: 0f) >= 0.5f
+        val maxBars = if (neural) NeuralMixTransitionPolicy.maxBars(compatibility).coerceAtMost(if (confidentBars) 16 else 4) else 16
         val result = (if (maxBars > 0) beatmix(input, outro, intro, outEnd, inStart, maxBars) else null)
             ?: fade(input, outro, intro, outEnd, inStart)
-        return if (neural && result is MixPlan) result.copy(neuralScore = compatibility, neuralMode = true) else result
+        val reason = when {
+            input.outgoingSignature == null -> "Outgoing audio analysis unavailable"
+            input.incomingSignature == null -> "Incoming audio analysis unavailable"
+            input.outgoingSignature.outroRhythm == null -> "No reliable outro beat pattern"
+            input.incomingSignature.introRhythm == null -> "No reliable intro beat pattern"
+            compatibility?.components?.get("rhythm") == null -> "Insufficient rhythmic variation"
+            maxBars == 0 -> "Low compatibility or evidence"
+            result is MixPlan && !result.beatLocked -> "Beat-lock constraints not met"
+            else -> "Beat-aligned transition"
+        }
+        return if (neural && result is MixPlan) result.copy(neuralScore = compatibility?.takeIf { it.components.containsKey("rhythm") }, neuralMode = true, neuralReason = reason) else result
     }
 
     /** The next track of the same album: the artist sequenced that join, keep it. */

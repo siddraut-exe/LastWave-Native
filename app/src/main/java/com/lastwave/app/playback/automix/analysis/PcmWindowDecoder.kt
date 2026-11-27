@@ -109,7 +109,17 @@ internal class PcmWindowDecoder(input: AnalysisInput) : Closeable {
                 continue
             }
             idleAfterInput = 0
-            val buffer = codec.getOutputBuffer(index)!!.order(ByteOrder.nativeOrder())
+            val endOfStream = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+            if (info.size == 0) {
+                codec.releaseOutputBuffer(index, false)
+                if (endOfStream) break
+                continue
+            }
+            val buffer = codec.getOutputBuffer(index)?.order(ByteOrder.nativeOrder())
+                ?: throw IOException("Decoder returned no PCM output buffer")
+            if (encoding != AudioFormat.ENCODING_PCM_16BIT && encoding != AudioFormat.ENCODING_PCM_FLOAT) {
+                throw IOException("Unsupported PCM encoding $encoding")
+            }
             val frameBytes = channels * if (encoding == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
             val frames = info.size / frameBytes
             var frame = 0
@@ -117,9 +127,10 @@ internal class PcmWindowDecoder(input: AnalysisInput) : Closeable {
             if (info.presentationTimeUs < fromUs) {
                 frame = ((fromUs - info.presentationTimeUs) * rate / 1_000_000).toInt().coerceAtMost(frames)
             }
-            if (startUs < 0 && frame < frames) startUs = info.presentationTimeUs + frame * 1_000_000L / rate
+            val lastFrame = ((untilUs - info.presentationTimeUs) * rate / 1_000_000L).coerceIn(0L, frames.toLong()).toInt()
+            if (startUs < 0 && frame < lastFrame) startUs = info.presentationTimeUs + frame * 1_000_000L / rate
             val base = info.offset
-            while (frame < frames) {
+            while (frame < lastFrame) {
                 var mono = 0.0
                 for (channel in 0 until channels) {
                     val position = base + (frame * channels + channel) * (frameBytes / channels)
@@ -138,7 +149,6 @@ internal class PcmWindowDecoder(input: AnalysisInput) : Closeable {
                 }
                 frame++
             }
-            val endOfStream = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
             val bufferEndUs = info.presentationTimeUs + frames * 1_000_000L / rate
             codec.releaseOutputBuffer(index, false)
             if (endOfStream || bufferEndUs >= untilUs) break
@@ -182,6 +192,7 @@ private class DataSourceMedia(private val input: AnalysisInput) : MediaDataSourc
             while (position < offset) {
                 val read = open.read(skipBuffer, 0, minOf(skipBuffer.size.toLong(), offset - position).toInt())
                 if (read == C.RESULT_END_OF_INPUT) return -1
+                if (read <= 0) throw IOException("No progress while seeking analysis stream")
                 position += read
             }
         }

@@ -74,6 +74,7 @@ data class MixView(
     val neuralScore: Double? = null,
     val neuralCoverage: Double? = null,
     val neuralComponents: Map<String, Double> = emptyMap(),
+    val neuralReason: String? = null,
 ) {
     fun incomingToOutgoing(incomingMs: Double): Double = cueOutMs + (incomingMs - cueInMs) / tempoRatio
 }

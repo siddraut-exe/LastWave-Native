@@ -931,8 +931,8 @@ fun SettingsScreen(
                                 title = "NeuralMix",
                                 subtitle = when {
                                     misc.isBitPerfectEnabled -> "Unavailable while Bit-Perfect is enabled"
-                                    hfSettings.neuralMixEnabled -> "Selected • Preview only; mixing engine pending"
-                                    else -> "Adaptive mixing • Development preview"
+                                    hfSettings.neuralMixEnabled -> "Selected • Compatibility-aware transitions"
+                                    else -> "Adaptive mixing • Experimental"
                                 },
                                 checked = hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled,
                                 onCheckedChange = viewModel::setNeuralMixEnabled,

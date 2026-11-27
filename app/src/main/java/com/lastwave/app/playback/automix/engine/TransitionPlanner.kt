@@ -14,6 +14,8 @@ import com.lastwave.app.playback.automix.api.MixShape
 import com.lastwave.app.playback.automix.api.CamelotKey
 import com.lastwave.app.playback.automix.api.TransitionDurationMode
 import com.lastwave.app.playback.automix.api.TransitionStyle
+import com.lastwave.app.playback.automix.neuralmix.NeuralMixTransitionPolicy
+import com.lastwave.app.playback.automix.neuralmix.SignatureCompatibility
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
@@ -101,7 +103,13 @@ object TransitionPlanner {
             ?.coerceIn(input.outgoingDurationMs - MAX_OUTRO_TRIM_MS, input.outgoingDurationMs)
             ?: input.outgoingDurationMs
         val inStart = intro?.audibleStartMs?.coerceIn(0L, MAX_INTRO_TRIM_MS) ?: 0L
-        return beatmix(input, outro, intro, outEnd, inStart) ?: fade(input, outro, intro, outEnd, inStart)
+        val maxBars = if (input.settings.neuralMixEnabled) {
+            NeuralMixTransitionPolicy.maxBars(input.outgoingSignature?.let { out ->
+                input.incomingSignature?.let { incoming -> SignatureCompatibility.compare(out, incoming) }
+            })
+        } else 16
+        return (if (maxBars > 0) beatmix(input, outro, intro, outEnd, inStart, maxBars) else null)
+            ?: fade(input, outro, intro, outEnd, inStart)
     }
 
     /** The next track of the same album: the artist sequenced that join, keep it. */
@@ -118,6 +126,7 @@ object TransitionPlanner {
         intro: WindowAnalysis?,
         outEnd: Long,
         inStart: Long,
+        maxBars: Int,
     ): MixPlan? {
         // Tempo matching changes the speed; never fight a user-chosen speed or pitch.
         if (input.userSpeed != 1f || input.userPitch != 1f || outro == null || intro == null) return null
@@ -136,7 +145,7 @@ object TransitionPlanner {
         val swapEnabled = input.settings.spectralFilterSweepsEnabled
         val shape = if (swapEnabled) MixShape.BASS_SWAP else MixShape.EQUAL_POWER
         // Clashing keys get the shortest phrase so the two harmonies barely meet.
-        val best = listOf(16, 8, 4).filter { it <= if (clash) 4 else preferred }.flatMap { bars ->
+        val best = listOf(16, 8, 4).filter { it <= minOf(maxBars, if (clash) 4 else preferred) }.flatMap { bars ->
             val overlap = bars * barMs
             val latest = outGrid.downbeatAtOrBefore(outEnd - overlap)
             val cueOuts = (0..MAX_PHRASE_SEARCH_BARS).map { latest - it * barMs }

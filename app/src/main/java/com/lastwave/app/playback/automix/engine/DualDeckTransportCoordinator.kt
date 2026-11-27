@@ -81,7 +81,8 @@ class DualDeckTransportCoordinator @Inject constructor(
     val telemetry: StateFlow<DeckBlendTelemetry> = _telemetry.asStateFlow()
 
     private var settings = AutoMixSettings()
-    val isEnabled: Boolean get() = settings.autoMixEnabled
+    val isEnabled: Boolean get() = settings.autoMixEnabled || (settings.neuralMixEnabled && !bitPerfectRequested)
+    private var bitPerfectRequested = false
     private var hardwareBypass = false
     private var jamActive = false
     private var transportPaused = false
@@ -122,8 +123,9 @@ class DualDeckTransportCoordinator @Inject constructor(
         scope.launch {
             preferences.settings.collect { latest ->
                 val changed = latest != settings
+                val modeChanged = latest.neuralMixEnabled != settings.neuralMixEnabled
                 settings = latest
-                if (!latest.autoMixEnabled) endTransition() else if (changed && session == null) resetPlan()
+                if (!isEnabled || modeChanged) endTransition() else if (changed && session == null) resetPlan()
             }
         }
     }
@@ -148,9 +150,10 @@ class DualDeckTransportCoordinator @Inject constructor(
         }
     }
 
-    fun updateHardwareBypassState(active: Boolean) {
+    fun updateHardwareBypassState(active: Boolean, bitPerfectRequested: Boolean = active) {
+        this.bitPerfectRequested = bitPerfectRequested
         hardwareBypass = active
-        if (active) endTransition()
+        if (active || (settings.neuralMixEnabled && bitPerfectRequested)) endTransition()
     }
 
     /** Listen Together keeps every listener on the same song edge: no mixing. */

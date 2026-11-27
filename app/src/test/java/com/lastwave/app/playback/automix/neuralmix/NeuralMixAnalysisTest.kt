@@ -19,6 +19,25 @@ class NeuralMixAnalysisTest {
         assertEquals(100.0,NeuralMixRanker.compare(a,a).score,0.001)
         assertEquals(0.7,NeuralMixRanker.compare(a,a).coverage,0.001)
     }
+    @Test fun flatRhythmDoesNotCountAsEvidence() {
+        val flat = List(16) { 1.0 }
+        val a = RhythmFingerprint(flat, flat, flat, 0.5, 120.0)
+        val score = NeuralMixRanker.compare(a, a)
+        assertFalse(score.components.containsKey("rhythm"))
+        assertEquals(0, NeuralMixTransitionPolicy.maxBars(score))
+    }
+    @Test fun halfTimeTempoIsCompatible() {
+        val a = fingerprint(0)
+        val score = NeuralMixRanker.compare(a, a.copy(bpm = a.bpm / 2))
+        assertEquals(1.0, requireNotNull(score.components["tempo"]), 0.001)
+    }
+    @Test fun cueRhythmPrefersAlignedEnvelopes() {
+        val bands = List(40) { (if (it % 5 == 0) 200 else 10) shl 16 }
+        val aligned = requireNotNull(CueRhythm.compare(bands, 0, 0.0, bands, 0, 0.0, 1.0, 2000.0))
+        val shifted = requireNotNull(CueRhythm.compare(bands, 0, 0.0, bands, 0, 100.0, 1.0, 2000.0))
+        assertTrue(aligned > shifted)
+        assertNull(CueRhythm.compare(List(40) { 0 }, 0, 0.0, bands, 0, 0.0, 1.0, 2000.0))
+    }
     @Test fun silenceIsUnknown() {
         assertNull(BeatSynchronousAnalyzer.analyze(FloatArray(64000),8000,0.0,0.0,120.0))
     }

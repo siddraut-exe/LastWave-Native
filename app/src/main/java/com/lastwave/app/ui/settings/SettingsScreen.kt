@@ -940,6 +940,59 @@ fun SettingsScreen(
                                 isHighlighted = highlightedSettingId == "audio.neuralmix",
                             )
                         }
+                        if (hfSettings.neuralMixEnabled && !misc.isBitPerfectEnabled) {
+                            add { position ->
+                                SettingsToggleCard(
+                                    icon = QualityGlyphs.AutoMix,
+                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    title = "Intelligent DJ",
+                                    subtitle = "Prefer compatible analysed tracks in automatic radio batches",
+                                    checked = hfSettings.intelligentDjEnabled,
+                                    onCheckedChange = viewModel::setIntelligentDjEnabled,
+                                    position = position,
+                                )
+                            }
+                            add { position ->
+                                SettingsToggleCard(
+                                    icon = QualityGlyphs.AutoMix,
+                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    title = "Smart bass exchange",
+                                    subtitle = "Reduce bass overlap during NeuralMix transitions",
+                                    checked = hfSettings.neuralBass,
+                                    onCheckedChange = viewModel::setNeuralBass,
+                                    position = position,
+                                )
+                            }
+                            add { position ->
+                                SettingsToggleCard(
+                                    icon = QualityGlyphs.AutoMix,
+                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    title = "Vocal protection",
+                                    subtitle = "Use synced lyrics to avoid overlapping vocal lines",
+                                    checked = hfSettings.neuralVocals,
+                                    onCheckedChange = viewModel::setNeuralVocals,
+                                    position = position,
+                                )
+                            }
+                            add { position ->
+                                SettingsActionCard(
+                                    icon = QualityGlyphs.AutoMix,
+                                    iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                    iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    title = "DJ analysis quality",
+                                    subtitle = when (hfSettings.neuralQuality.name) {
+                                        "ECO" -> "Efficient • Cached candidates only"
+                                        "PERFORMANCE" -> "Maximum • Up to 3 fresh candidates"
+                                        else -> "Balanced • Up to 1 fresh candidate"
+                                    },
+                                    onClick = { viewModel.cycleNeuralQuality() },
+                                    position = position,
+                                )
+                            }
+                        }
                         add { position ->
                             SettingsToggleCard(
                                 icon = QualityGlyphs.MusicHaptics,

@@ -11,12 +11,15 @@ object NeuralMixRanker {
         fun add(name: String, w: Double, value: Double?) { if (value != null && value.isFinite()) { val v = value.coerceIn(0.0,1.0); parts[name]=v; weight+=w; sum+=w*v } }
         fun similarity(x: List<Double>, y: List<Double>): Double? {
             if (x.size != 16 || y.size != 16) return null
-            val xx=x.sumOf { it*it }; val yy=y.sumOf { it*it }
-            if (xx < 1e-9 || yy < 1e-9) return null
-            return x.indices.sumOf { x[it]*y[it] } / sqrt(xx*yy)
+            if (x.any { !it.isFinite() } || y.any { !it.isFinite() }) return null
+            val xm = x.average(); val ym = y.average()
+            val xc = x.map { it - xm }; val yc = y.map { it - ym }
+            val xx = xc.sumOf { it*it }; val yy = yc.sumOf { it*it }
+            if (xx < 0.01 || yy < 0.01) return null
+            return (xc.indices.sumOf { xc[it]*yc[it] } / sqrt(xx*yy)).coerceIn(0.0, 1.0)
         }
         add("rhythm",25.0,similarity(a.rhythm,b.rhythm))
-        add("tempo",15.0,if(a.bpm>0 && b.bpm>0) exp(-abs(ln(a.bpm/b.bpm))*8) else null)
+        add("tempo",15.0,if(a.bpm>0 && b.bpm>0) exp(-listOf(0.5, 1.0, 2.0).minOf { abs(ln(a.bpm/(b.bpm*it))) }*8) else null)
         add("harmonic",20.0,keyMatch(outgoingKey,incomingKey))
         add("bass",15.0,similarity(a.bass,b.bass))
         add("energy",10.0,if(a.rms>0 && b.rms>0) exp(-abs(ln(a.rms/b.rms))) else null)

@@ -70,6 +70,10 @@ data class MixView(
     val bars: Int?,
     val style: TransitionStyle,
     val keyPair: String?,
+    val neuralMode: Boolean = false,
+    val neuralScore: Double? = null,
+    val neuralCoverage: Double? = null,
+    val neuralComponents: Map<String, Double> = emptyMap(),
 ) {
     fun incomingToOutgoing(incomingMs: Double): Double = cueOutMs + (incomingMs - cueInMs) / tempoRatio
 }

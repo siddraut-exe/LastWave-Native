@@ -4994,6 +4994,7 @@ class MusicPlayer @Inject constructor(
                     }
 
                     if (toAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@withLock
+                    val rankedToAdd = rankNeuralRadio(toAdd)
 
                     withContext(Dispatchers.Main.immediate) {
                         if (!radioQueueActive || !playerDelegate.isInitialized() || expectedGeneration != playRequestGeneration.get()) return@withContext
@@ -5010,7 +5011,7 @@ class MusicPlayer @Inject constructor(
                         val currentKeys = (0 until player.mediaItemCount).mapTo(mutableSetOf()) {
                             player.getMediaItemAt(it).toPlayableTrack().queueKey()
                         }
-                        val validToAdd = toAdd.filter { it.queueKey() !in currentKeys }
+                        val validToAdd = (if (autoMixCoordinator.get().intelligentDjActive()) rankedToAdd else toAdd).filter { it.queueKey() !in currentKeys }
                         if (validToAdd.isNotEmpty()) {
                             val previousCount = player.mediaItemCount
                             appendToQueueEnd(validToAdd.map(PlayableTrack::toMediaItem))
@@ -5033,6 +5034,39 @@ class MusicPlayer @Inject constructor(
                     android.util.Log.d("MusicPlayer", "Failed to start radio queue", e)
                 }
             }
+        }
+    }
+
+    private suspend fun rankNeuralRadio(candidates: List<PlayableTrack>): List<PlayableTrack> {
+        val tail = withContext(Dispatchers.Main.immediate) {
+            if (!playerDelegate.isInitialized() || !autoMixCoordinator.get().intelligentDjActive() || player.mediaItemCount == 0) null
+            else player.getMediaItemAt(player.mediaItemCount - 1)
+        } ?: return candidates
+        val coordinator = autoMixCoordinator.get()
+        // Only inspect already available local/direct streams or ordinary YouTube preloads.
+        // The radio queue must never wait indefinitely for analysis.
+        withTimeoutOrNull(8_000L) {
+            val limit = withContext(Dispatchers.Main.immediate) { coordinator.freshDjLimit() }
+            for (track in candidates.take(limit)) {
+                val item = track.toMediaItem()
+                val resolved = if (item.localConfiguration?.uri?.scheme == "lastwave" && !track.videoId.isNullOrBlank()) {
+                    resolvePreloadYoutube(track, selectedStreamingQuality(latestPlaybackSettings))
+                } else null
+                if (resolved?.segmentedDrm != null) continue
+                val ready = if (resolved != null) track.toMediaItem(resolved) else item
+                val input = if (resolved != null) {
+                    val spec = DataSpec.Builder().setUri(resolved.url).setKey(resolved.cacheKey).build()
+                    com.lastwave.app.playback.automix.analysis.AnalysisInput(cacheDataSourceFactory, spec.withRequestHeaders(mediaRequestHeaders(resolved)))
+                } else autoMixAnalysisInput(ready)
+                if (input == null) continue
+                val key = withContext(Dispatchers.Main.immediate) { coordinator.requestDjAnalysis(track, ready, input) } ?: break
+                while (!coordinator.djAnalysisSettled(key)) kotlinx.coroutines.delay(150L)
+            }
+        }
+        return withContext(Dispatchers.Main.immediate) {
+            if (!coordinator.intelligentDjActive() || !playerDelegate.isInitialized() || player.mediaItemCount == 0 ||
+                player.getMediaItemAt(player.mediaItemCount - 1).mediaId != tail.mediaId) candidates
+            else coordinator.rankCachedRadio(tail, candidates)
         }
     }
 
@@ -5151,13 +5185,14 @@ class MusicPlayer @Inject constructor(
                 } else toAdd
 
                 if (finalToAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@launch
+                val rankedToAdd = rankNeuralRadio(finalToAdd)
 
                 withContext(Dispatchers.Main.immediate) {
                     if (!radioQueueActive || !playerDelegate.isInitialized() || expectedGeneration != playRequestGeneration.get()) return@withContext
                     val existingKeys = (0 until player.mediaItemCount).mapTo(mutableSetOf()) {
                         player.getMediaItemAt(it).toPlayableTrack().queueKey()
                     }
-                    val validToAdd = finalToAdd.filter { it.queueKey() !in existingKeys }
+                    val validToAdd = (if (autoMixCoordinator.get().intelligentDjActive()) rankedToAdd else finalToAdd).filter { it.queueKey() !in existingKeys }
                     if (validToAdd.isNotEmpty()) {
                         val previousCount = player.mediaItemCount
                         appendToQueueEnd(validToAdd.map(PlayableTrack::toMediaItem))

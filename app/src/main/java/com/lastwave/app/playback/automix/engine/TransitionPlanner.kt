@@ -51,6 +51,8 @@ data class MixPlan(
     val outGrid: BeatGrid? = null,
     val inGrid: BeatGrid? = null,
     val bars: Int? = null,
+    val neuralScore: com.lastwave.app.playback.automix.neuralmix.CompatibilityScore? = null,
+    val neuralMode: Boolean = false,
 ) : MixDecision {
     val endOutMs: Long get() = cueOutMs + overlapMs
 
@@ -103,13 +105,14 @@ object TransitionPlanner {
             ?.coerceIn(input.outgoingDurationMs - MAX_OUTRO_TRIM_MS, input.outgoingDurationMs)
             ?: input.outgoingDurationMs
         val inStart = intro?.audibleStartMs?.coerceIn(0L, MAX_INTRO_TRIM_MS) ?: 0L
-        val maxBars = if (input.settings.neuralMixEnabled) {
-            NeuralMixTransitionPolicy.maxBars(input.outgoingSignature?.let { out ->
-                input.incomingSignature?.let { incoming -> SignatureCompatibility.compare(out, incoming) }
-            })
-        } else 16
-        return (if (maxBars > 0) beatmix(input, outro, intro, outEnd, inStart, maxBars) else null)
+        val neural = input.settings.neuralMixEnabled
+        val compatibility = if (neural) input.outgoingSignature?.let { out ->
+            input.incomingSignature?.let { incoming -> SignatureCompatibility.compare(out, incoming) }
+        } else null
+        val maxBars = if (neural) NeuralMixTransitionPolicy.maxBars(compatibility) else 16
+        val result = (if (maxBars > 0) beatmix(input, outro, intro, outEnd, inStart, maxBars) else null)
             ?: fade(input, outro, intro, outEnd, inStart)
+        return if (neural && result is MixPlan) result.copy(neuralScore = compatibility, neuralMode = true) else result
     }
 
     /** The next track of the same album: the artist sequenced that join, keep it. */
@@ -132,7 +135,7 @@ object TransitionPlanner {
         if (input.userSpeed != 1f || input.userPitch != 1f || outro == null || intro == null) return null
         val outGrid = outro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE } ?: return null
         val inGrid = intro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE } ?: return null
-        val ratio = tempoRatio(outGrid, inGrid) ?: return null
+        val ratio = tempoRatio(outGrid, inGrid, input.settings.neuralMixEnabled) ?: return null
         val keys = keyPair(outro, intro)
         val clash = keys?.let {
             AutoMixCamelotClassifier.evaluateCompatibility(it.first, it.second).tier == HarmonicCompatibilityTier.DISSONANT
@@ -142,7 +145,7 @@ object TransitionPlanner {
             TransitionDurationMode.AUTO -> if (8 * barMs <= AUTO_BEATMIX_MAX_MS) 8 else 4
             TransitionDurationMode.MANUAL -> listOf(4, 8, 16).minBy { abs(it * barMs - input.settings.targetDurationSeconds * 1000.0) }
         }
-        val swapEnabled = input.settings.spectralFilterSweepsEnabled
+        val swapEnabled = if (input.settings.neuralMixEnabled) input.settings.neuralBass else input.settings.spectralFilterSweepsEnabled
         val shape = if (swapEnabled) MixShape.BASS_SWAP else MixShape.EQUAL_POWER
         // Clashing keys get the shortest phrase so the two harmonies barely meet.
         val best = listOf(16, 8, 4).filter { it <= minOf(maxBars, if (clash) 4 else preferred) }.flatMap { bars ->
@@ -158,7 +161,7 @@ object TransitionPlanner {
         }.map { candidate ->
             candidate to score(candidate, preferred, ratio, shape, outro, intro, input)
         }.maxByOrNull { it.second.total }
-            ?.takeIf { it.second.clashMs <= MAX_BEATMIX_CLASH_MS }
+            ?.takeIf { (input.settings.neuralMixEnabled && !input.settings.neuralVocals) || it.second.clashMs <= MAX_BEATMIX_CLASH_MS }
             ?: return null
         val (chosen, verdict) = best
         val swapAt = if (swapEnabled) (chosen.cueOut + chosen.bars / 2 * barMs).roundToLong() else null
@@ -225,13 +228,20 @@ object TransitionPlanner {
             input.outgoingSignature, input.incomingSignature,
             candidate.cueOut, candidate.cueIn, candidate.overlap, ratio, shape,
         )
-        val total = sectionAtStart.coerceAtMost(PHRASE_SCORE_CAP) +
+        val protect = !input.settings.neuralMixEnabled || input.settings.neuralVocals
+        val localRhythm = if (input.settings.neuralMixEnabled) {
+            com.lastwave.app.playback.automix.neuralmix.CueRhythm.compare(
+                outro.bands, outro.startMs, candidate.cueOut,
+                intro.bands, intro.startMs, candidate.cueIn, ratio.toDouble(), candidate.overlap,
+            ) ?: 0.0
+        } else 0.0
+        val total = 3.0 * localRhythm + sectionAtStart.coerceAtMost(PHRASE_SCORE_CAP) +
             dropAtEnd.coerceAtMost(PHRASE_SCORE_CAP) -
             candidate.barsBack * LOST_BAR_COST -
             (preferredBars / candidate.bars - 1) * SHORTER_PHRASE_COST -
-            vocals.clashMs / 1000.0 * CLASH_COST_PER_SECOND -
-            (if (vocals.cutsLine) CUT_LINE_COST else 0.0) -
-            (if (vocals.hidesEntry) HIDDEN_ENTRY_COST else 0.0) -
+            (if (protect) vocals.clashMs / 1000.0 * CLASH_COST_PER_SECOND else 0.0) -
+            (if (protect && vocals.cutsLine) CUT_LINE_COST else 0.0) -
+            (if (protect && vocals.hidesEntry) HIDDEN_ENTRY_COST else 0.0) -
             (candidate.cueIn - intro.startMs).coerceAtLeast(0.0) / bar * SKIPPED_INTRO_BAR_COST
         return Verdict(total, vocals.clashMs, vocals.cutsLine, vocals.known)
     }
@@ -263,26 +273,27 @@ object TransitionPlanner {
         val inSig = input.incomingSignature
         // Wait for the singer: a line still running while the old song turns
         // down is cut mid-word, so the fade starts when that line ends.
+        val protect = !input.settings.neuralMixEnabled || input.settings.neuralVocals
         val lineEnd = outSig?.vocals
             ?.filter { it.startMs < cueOut + overlap * 3 / 4 && it.endMs > cueOut }
             ?.maxOfOrNull { it.endMs }
-        if (lineEnd != null && shape != MixShape.HOLD_OUTGOING) {
-            cueOut = minOf(lineEnd, outEnd - MIN_VOCAL_FADE_MS)
+        if (protect && lineEnd != null && shape != MixShape.HOLD_OUTGOING) {
+            cueOut = minOf(lineEnd, outEnd - MIN_VOCAL_FADE_MS).coerceAtLeast(0L)
             overlap = outEnd - cueOut
         }
         // A new vocal should not start while the next song is still faint under the old one.
         val firstLine = inSig?.vocals?.firstOrNull { it.endMs > inStart }?.startMs
-        if (firstLine != null && firstLine < inStart + overlap / 2) {
+        if (protect && firstLine != null && firstLine < inStart + overlap / 2) {
             overlap = maxOf(MIN_VOCAL_FADE_MS, (firstLine - inStart) * 2).coerceAtMost(outEnd - cueOut)
             cueOut = outEnd - overlap
         }
         val outVocals = outSig?.hasVocalsBetween(cueOut, outEnd)
         val inVocals = inSig?.hasVocalsBetween(inStart, inStart + overlap)
-        if (outVocals == true && inVocals == true && overlap > VOCAL_CLASH_MS) {
+        if (protect && outVocals == true && inVocals == true && overlap > VOCAL_CLASH_MS) {
             overlap = VOCAL_CLASH_MS
             cueOut = outEnd - overlap
         }
-        val swap = input.settings.spectralFilterSweepsEnabled && when (shape) {
+        val swap = (if (input.settings.neuralMixEnabled) input.settings.neuralBass else input.settings.spectralFilterSweepsEnabled) && when (shape) {
             MixShape.HOLD_OUTGOING -> overlap >= 1_500L
             else -> overlap >= 6_000L
         }
@@ -305,11 +316,11 @@ object TransitionPlanner {
     }
 
     /** Incoming speed that matches the outgoing tempo, allowing half/double time, or null if too far. */
-    private fun tempoRatio(outGrid: BeatGrid, inGrid: BeatGrid): Float? =
+    private fun tempoRatio(outGrid: BeatGrid, inGrid: BeatGrid, neural: Boolean): Float? =
         listOf(0.5f, 1f, 2f)
             .map { factor -> outGrid.bpm / (inGrid.bpm * factor) }
             .minBy { abs(it - 1f) }
-            .takeIf { abs(it - 1f) <= MAX_TEMPO_STRETCH }
+            .takeIf { abs(it - 1f) <= if (neural) 0.08f else MAX_TEMPO_STRETCH }
 
     private fun keyPair(outro: WindowAnalysis?, intro: WindowAnalysis?): Pair<CamelotKey, CamelotKey>? {
         val out = outro?.camelotKey?.takeIf { outro.keyConfidence >= MIN_KEY_CONFIDENCE } ?: return null

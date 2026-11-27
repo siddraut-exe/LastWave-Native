@@ -30,6 +30,10 @@ data class AutoMixSettings(
     val spectralFilterSweepsEnabled: Boolean = true,
     val thermalProfile: ThermalProfile = ThermalProfile.BALANCED,
     val neuralMixEnabled: Boolean = false,
+    val intelligentDjEnabled: Boolean = false,
+    val neuralBass: Boolean = true,
+    val neuralVocals: Boolean = true,
+    val neuralQuality: ThermalProfile = ThermalProfile.BALANCED,
 )
 
 internal val Context.autoMixDataStore by preferencesDataStore(name = "automix_prefs")
@@ -39,6 +43,10 @@ class AutoMixPreferences @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
     private object Keys {
+        val NEURAL_BASS = booleanPreferencesKey("neuralmix_bass")
+        val NEURAL_VOCALS = booleanPreferencesKey("neuralmix_vocals")
+        val NEURAL_QUALITY = stringPreferencesKey("neuralmix_quality")
+        val DJ_ENABLED = booleanPreferencesKey("neuralmix_dj_enabled")
         val NEURAL_ENABLED = booleanPreferencesKey("neuralmix_enabled")
         val ENABLED = booleanPreferencesKey("automix_enabled")
         val LEGACY_ENABLED = booleanPreferencesKey("harmonic_flow_enabled")
@@ -62,6 +70,10 @@ class AutoMixPreferences @Inject constructor(
         AutoMixSettings(
             autoMixEnabled = isEnabled && prefs[Keys.NEURAL_ENABLED] != true,
             neuralMixEnabled = prefs[Keys.NEURAL_ENABLED] ?: false,
+            intelligentDjEnabled = prefs[Keys.DJ_ENABLED] ?: false,
+            neuralBass = prefs[Keys.NEURAL_BASS] ?: true,
+            neuralVocals = prefs[Keys.NEURAL_VOCALS] ?: true,
+            neuralQuality = runCatching { ThermalProfile.valueOf(prefs[Keys.NEURAL_QUALITY] ?: "BALANCED") }.getOrDefault(ThermalProfile.BALANCED),
             durationMode = mode,
             targetDurationSeconds = (prefs[Keys.TARGET_SECONDS] ?: 12).coerceIn(12, 30),
             spectralFilterSweepsEnabled = prefs[Keys.SPECTRAL_SWEEPS] ?: true,
@@ -85,6 +97,14 @@ class AutoMixPreferences @Inject constructor(
                 it[Keys.LEGACY_ENABLED] = false
             }
         }
+    }
+
+    suspend fun setNeuralBass(enabled: Boolean) { context.autoMixDataStore.edit { it[Keys.NEURAL_BASS] = enabled } }
+    suspend fun setNeuralVocals(enabled: Boolean) { context.autoMixDataStore.edit { it[Keys.NEURAL_VOCALS] = enabled } }
+    suspend fun setNeuralQuality(value: ThermalProfile) { context.autoMixDataStore.edit { it[Keys.NEURAL_QUALITY] = value.name } }
+
+    suspend fun setIntelligentDjEnabled(enabled: Boolean) {
+        context.autoMixDataStore.edit { it[Keys.DJ_ENABLED] = enabled }
     }
 
     suspend fun setDurationMode(mode: TransitionDurationMode) {

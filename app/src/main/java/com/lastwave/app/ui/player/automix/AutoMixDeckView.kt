@@ -75,7 +75,7 @@ internal fun AutoMixDeckView(
     BoxWithConstraints(modifier) {
         val fontScale = LocalDensity.current.fontScale
         val compact = maxHeight < 350.dp && maxWidth >= 440.dp
-        val contentHeight = maxOf(maxHeight, (if (compact) 100.dp else 180.dp) * fontScale + 180.dp)
+        val contentHeight = maxOf(maxHeight, (if (compact) 100.dp else 180.dp) * fontScale + 180.dp + if (view.neuralMode) 88.dp * fontScale else 0.dp)
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
             Column(
                 modifier = Modifier.fillMaxWidth().height(contentHeight).padding(horizontal = 20.dp, vertical = 4.dp),
@@ -89,6 +89,19 @@ internal fun AutoMixDeckView(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                }
+                if (view.neuralMode) {
+                    Text("NeuralMix Studio", color = StudioContent, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        view.neuralScore?.let { "Compatibility ${it.toInt()}% • Evidence ${((view.neuralCoverage ?: 0.0) * 100).toInt()}%" }
+                            ?: "Compatibility unavailable • Conservative transition",
+                        color = StudioContent.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Text(view.neuralComponents.entries.joinToString(" • ") { (key, value) -> "${key.replaceFirstChar { it.uppercase() }} ${(value * 100).toInt()}%" },
+                        color = StudioContent.copy(alpha = 0.8f), style = MaterialTheme.typography.labelSmall)
+                    Text("Tempo ×${"%.3f".format(view.tempoRatio)} • ${view.overlapMs / 1000.0}s",
+                        color = StudioContent.copy(alpha = 0.8f), style = MaterialTheme.typography.labelMedium)
                 }
                 if (compact) {
                     Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {

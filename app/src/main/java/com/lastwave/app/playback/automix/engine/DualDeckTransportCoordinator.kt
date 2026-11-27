@@ -14,6 +14,7 @@ import com.lastwave.app.playback.automix.analysis.AnalysisInput
 import com.lastwave.app.playback.automix.analysis.WindowAnalysis
 import com.lastwave.app.playback.automix.api.AutoMixPreferences
 import com.lastwave.app.playback.automix.api.AutoMixSettings
+import com.lastwave.app.playback.automix.api.MixEngine
 import com.lastwave.app.playback.automix.api.MixShape
 import com.lastwave.app.playback.automix.api.BlendPhase
 import com.lastwave.app.playback.automix.api.DeckBlendTelemetry
@@ -87,6 +88,15 @@ class DualDeckTransportCoordinator @Inject constructor(
     private var hardwareBypass = false
     private var jamActive = false
     private var transportPaused = false
+
+    private fun selectedEngine(): MixEngine = when {
+        !isEnabled || hardwareBypass || jamActive -> MixEngine.NONE
+        settings.neuralMixEnabled && !bitPerfectRequested -> MixEngine.NEURALMIX
+        else -> MixEngine.AUTOMIX
+    }
+
+    private fun idleTelemetry() = DeckBlendTelemetry.IDLE.copy(engine = selectedEngine())
+    fun neuralMixSelected(): Boolean = selectedEngine() == MixEngine.NEURALMIX
     var baseVolume = 1f
         private set
 
@@ -126,12 +136,41 @@ class DualDeckTransportCoordinator @Inject constructor(
                 val changed = latest != settings
                 val modeChanged = latest.neuralMixEnabled != settings.neuralMixEnabled
                 settings = latest
-                if (!isEnabled || modeChanged) endTransition() else if (changed && session == null) resetPlan()
+                if (!isEnabled || modeChanged) {
+                    endTransition()
+                    _telemetry.value = idleTelemetry()
+                } else if (changed && session == null) resetPlan()
             }
         }
     }
 
+    /** Snapshot before MusicPlayer clears the previous plan on a natural advance. */
+    fun unmixedAdvanceReason(): String? {
+        if (selectedEngine() != MixEngine.NEURALMIX || session != null || swapping) return null
+        return when (val plan = decision) {
+            is MixBypass -> plan.reason
+            is MixPlan -> "Planned transition did not start before the track ended"
+            null -> "No transition plan was ready"
+        }
+    }
+
+    fun reportUnmixedAdvance(reason: String) {
+        if (selectedEngine() != MixEngine.NEURALMIX || session != null) return
+        val result = idleTelemetry().copy(noMixReason = reason, noMixCompleted = true)
+        _telemetry.value = result
+        Log.i(TAG, "NeuralMix did not mix: $reason")
+        scope.launch {
+            delay(4_000L)
+            if (_telemetry.value === result) _telemetry.value = idleTelemetry()
+        }
+    }
+
+    fun intelligentDjRequested(): Boolean = settings.neuralMixEnabled && settings.intelligentDjEnabled
+
     fun intelligentDjActive(): Boolean = settings.neuralMixEnabled && settings.intelligentDjEnabled && !bitPerfectRequested && !hardwareBypass && !jamActive
+
+    fun djAllQueues(): Boolean = settings.neuralAllQueues
+    fun djPriorityLimit(): Int = minOf(settings.neuralPriorityTracks, freshDjLimit())
 
     fun freshDjLimit(): Int = if (!intelligentDjActive()) 0 else when (settings.neuralQuality) {
         com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> 3
@@ -150,7 +189,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         if (introOnly) analyzer.isIntroSettled(key) else analyzer.isSettled(key)
     fun djAnalysisStatus(key: String, introOnly: Boolean = false): String = analyzer.status(key, introOnly)
 
-    /** Rank only a pair the real planner can actually beat-lock, using the analysed renditions. */
+    /** Prefer beat-lock, but rank useful fade candidates independently of strict beat-lock constraints. */
     fun djCandidateScore(outgoing: MediaItem, incoming: MediaItem, durationMs: Long): Double? {
         if (!intelligentDjActive()) return null
         val out = analyzer.signature(analysisKey(outgoing)) ?: return null
@@ -163,7 +202,13 @@ class DualDeckTransportCoordinator @Inject constructor(
         )) as? MixPlan ?: return null
         val score = decision.neuralScore
         Log.i(TAG, "NeuralMix DJ '${incoming.mediaMetadata.title}': ${decision.neuralReason}, score=${score?.score}, coverage=${score?.coverage}")
-        return if (decision.beatLocked && score != null) score.score * score.coverage else null
+        return com.lastwave.app.playback.automix.neuralmix.NeuralDjSchedule.rank(score, decision.beatLocked)
+    }
+
+    /** A chain edge is evaluated against the actual preceding track's outro. */
+    fun djSequenceScore(outgoing: MediaItem, incoming: MediaItem): Double? {
+        val signature = analyzer.signature(analysisKey(outgoing)) ?: return null
+        return djCandidateScore(outgoing, incoming, signature.durationMs)
     }
 
     fun setBaseVolume(volume: Float) {
@@ -189,13 +234,19 @@ class DualDeckTransportCoordinator @Inject constructor(
     fun updateHardwareBypassState(active: Boolean, bitPerfectRequested: Boolean = active) {
         this.bitPerfectRequested = bitPerfectRequested
         hardwareBypass = active
-        if (active || (settings.neuralMixEnabled && bitPerfectRequested)) endTransition()
+        if (active || (settings.neuralMixEnabled && bitPerfectRequested)) {
+            endTransition()
+            _telemetry.value = idleTelemetry()
+        }
     }
 
     /** Listen Together keeps every listener on the same song edge: no mixing. */
     fun setJamActive(active: Boolean) {
         jamActive = active
-        if (active) endTransition()
+        if (active) {
+            endTransition()
+            _telemetry.value = idleTelemetry()
+        }
     }
 
     /**
@@ -310,11 +361,16 @@ class DualDeckTransportCoordinator @Inject constructor(
         return late
     }
 
-    private fun start(outgoing: ExoPlayer, incoming: ExoPlayer, plan: MixPlan, startIn: Long) {
+    private fun start(outgoing: ExoPlayer, incoming: ExoPlayer, requestedPlan: MixPlan, startIn: Long) {
         finishTempoGlide()
         val userParameters = outgoing.playbackParameters
         val outSink = deckSink?.invoke(outgoing)
         val inSink = deckSink?.invoke(incoming)
+        val plan = if (requestedPlan.neuralMode && requestedPlan.bassSwapAtMs != null && (outSink == null || inSink == null)) {
+            requestedPlan.copy(shape = MixShape.EQUAL_POWER, bassSwapAtMs = null, bassSwapRampMs = 0L,
+                style = if (requestedPlan.beatLocked) requestedPlan.style else com.lastwave.app.playback.automix.api.TransitionStyle.PERCEPTUAL_FADE,
+                neuralReason = "EQ taps unavailable; equal-power blend")
+        } else requestedPlan
         incoming.volume = 0f
         if (abs(incoming.currentPosition - startIn) > CUE_TOLERANCE_MS) incoming.seekTo(startIn)
         incoming.playbackParameters = if (plan.beatLocked) PlaybackParameters(plan.tempoRatio, 1f) else userParameters
@@ -350,6 +406,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         _telemetry.update {
             it.copy(
                 phase = BlendPhase.BLENDING,
+                engine = if (plan.neuralMode) MixEngine.NEURALMIX else MixEngine.AUTOMIX,
                 blendProgress = 0f,
                 activeTransitionStyle = plan.style,
                 spliceStartPositionMs = plan.cueOutMs,
@@ -367,15 +424,22 @@ class DualDeckTransportCoordinator @Inject constructor(
     private suspend fun run(active: Session) {
         val lock = if (active.plan.beatLocked) PhaseLock(active.plan, active.outgoingTaps?.kicks, active.incomingTaps?.kicks) else null
         val level = LevelGuide(active.outgoingTaps?.level, active.incomingTaps?.level)
+        var lastTick = SystemClock.elapsedRealtime()
+        var activeElapsed = 0L
+        var maxProgress = 0f
         while (scope.isActive) {
             delay(TICK_MS)
+            val now = SystemClock.elapsedRealtime()
+            val delta = (now - lastTick).coerceAtLeast(0L)
+            lastTick = now
             if (transportPaused) {
                 lock?.reset()
                 continue
             }
             val outgoing = active.outgoing
             val incoming = active.incoming
-            val elapsed = SystemClock.elapsedRealtime() - active.startedAtMs
+            activeElapsed += delta
+            val elapsed = if (active.plan.neuralMode) activeElapsed else now - active.startedAtMs
             val outgoingDone = outgoing.playbackState == Player.STATE_ENDED || outgoing.playerError != null
             if (incoming.playerError != null) {
                 Log.w(TAG, "Incoming deck failed mid-blend", incoming.playerError)
@@ -385,8 +449,10 @@ class DualDeckTransportCoordinator @Inject constructor(
             val inPos = incoming.currentPosition
             // Progress follows the incoming deck's own clock: if it stalls
             // buffering, the blend waits instead of fading into silence.
-            val progress = ((inPos - active.plan.cueInMs).toFloat() /
+            val rawProgress = ((inPos - active.plan.cueInMs).toFloat() /
                 (active.plan.overlapMs * active.plan.tempoRatio)).coerceIn(0f, 1f)
+            val progress = if (active.plan.neuralMode) maxOf(maxProgress, rawProgress) else rawProgress
+            maxProgress = progress
             lock?.update(outgoing, incoming, progress)
             val (outGain, inGain) = MixCurve.gains(progress, active.plan.shape)
             val trim = level.correction(progress, if (outgoingDone) 0f else outGain, inGain)
@@ -398,6 +464,12 @@ class DualDeckTransportCoordinator @Inject constructor(
             }
             // A deck that never starts must not hold the queue forever.
             val overdue = elapsed > active.plan.overlapMs / active.plan.tempoRatio + LOCK_LEAD_MS + WATCHDOG_SLACK_MS
+            if (overdue && progress < 1f && active.plan.neuralMode) {
+                Log.w(TAG, "NeuralMix transition stalled; recovering playback")
+                endTransition()
+                reportUnmixedAdvance("Transition interrupted before completion")
+                return
+            }
             if (progress >= 1f || overdue) break
         }
         complete(active)
@@ -432,7 +504,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         scope.launch {
             delay(COMPLETED_BADGE_MS)
             if (session == null && _telemetry.value.phase == BlendPhase.MIX_COMPLETED) {
-                _telemetry.value = DeckBlendTelemetry.IDLE
+                _telemetry.value = idleTelemetry()
             }
         }
     }
@@ -450,6 +522,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         val active = session
         if (active == null) {
             resetPlan()
+            if (_telemetry.value.noMixCompleted) _telemetry.value = idleTelemetry()
             return
         }
         session = null
@@ -523,6 +596,7 @@ class DualDeckTransportCoordinator @Inject constructor(
     }
 
     private fun publishPlan(next: PlayableTrack) {
+        if (_telemetry.value.noMixCompleted && selectedEngine() == MixEngine.NEURALMIX) return
         val preview = TrackChromeSummary(
             title = next.title,
             artist = next.artist,
@@ -530,10 +604,11 @@ class DualDeckTransportCoordinator @Inject constructor(
             durationMs = next.durationMs ?: 0L,
         )
         _telemetry.value = when (val current = decision) {
-            null -> DeckBlendTelemetry(phase = BlendPhase.PRE_ANALYZING, incomingTrackPreview = preview)
-            is MixBypass -> DeckBlendTelemetry.IDLE
+            null -> DeckBlendTelemetry(phase = BlendPhase.PRE_ANALYZING, incomingTrackPreview = preview, engine = selectedEngine())
+            is MixBypass -> idleTelemetry().copy(noMixReason = current.reason)
             is MixPlan -> DeckBlendTelemetry(
                 phase = BlendPhase.ARMED,
+                engine = if (current.neuralMode) MixEngine.NEURALMIX else MixEngine.AUTOMIX,
                 activeTransitionStyle = current.style,
                 syncedBpm = current.bpm,
                 harmonicKeyPair = current.keyPair,
@@ -554,8 +629,8 @@ class DualDeckTransportCoordinator @Inject constructor(
         decisionInputs = null
         cuedStandbyFor = null
         planContext = null
-        if (!keepTelemetry && _telemetry.value.phase != BlendPhase.MIX_COMPLETED) {
-            _telemetry.value = DeckBlendTelemetry.IDLE
+        if (!keepTelemetry && _telemetry.value.phase != BlendPhase.MIX_COMPLETED && !_telemetry.value.noMixCompleted) {
+            _telemetry.value = idleTelemetry()
         }
     }
 

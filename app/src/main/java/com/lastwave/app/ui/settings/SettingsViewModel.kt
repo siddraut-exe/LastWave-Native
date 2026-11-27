@@ -840,6 +840,8 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun setNeuralAllQueues(enabled: Boolean) = launchSettingsAction("update NeuralMix queue scope") { autoMixPreferences.setNeuralAllQueues(enabled) }
+    fun setNeuralPriorityTracks(value: Int) = launchSettingsAction("update NeuralMix priority size") { autoMixPreferences.setNeuralPriorityTracks(value) }
     fun setNeuralBass(enabled: Boolean) = launchSettingsAction("update NeuralMix bass") { autoMixPreferences.setNeuralBass(enabled) }
     fun setNeuralVocals(enabled: Boolean) = launchSettingsAction("update NeuralMix vocals") { autoMixPreferences.setNeuralVocals(enabled) }
     fun setNeuralQuality(value: com.lastwave.app.playback.automix.api.ThermalProfile) = launchSettingsAction("update NeuralMix quality") {

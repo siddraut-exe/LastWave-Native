@@ -2,9 +2,10 @@ package com.lastwave.app.playback.automix.api
 
 import androidx.compose.runtime.Immutable
 
-/**
- * Phase of the dual-deck transition lifecycle.
- */
+/** Effective mixing mode, independent of whether an acoustic plan exists yet. */
+enum class MixEngine { NONE, AUTOMIX, NEURALMIX }
+
+/** Phase of the dual-deck transition lifecycle. */
 enum class BlendPhase {
     IDLE,
     PRE_ANALYZING,
@@ -104,7 +105,21 @@ data class DeckBlendTelemetry(
     val isVocalProtected: Boolean = true,
     /** Null when either song lacks analysis; the UI then keeps the artwork. */
     val view: MixView? = null,
+    val engine: MixEngine = MixEngine.NONE,
+    val noMixReason: String? = null,
+    /** True after a natural track advance with no overlap; never mark it MIX_COMPLETED. */
+    val noMixCompleted: Boolean = false,
 ) {
+    val isNeuralMix: Boolean get() = engine == MixEngine.NEURALMIX || view?.neuralMode == true
+    val mixName: String get() = if (isNeuralMix) "NeuralMix" else "AutoMix"
+
+    val mixStatusLabel: String get() = when {
+        isNeuralMix && noMixReason != null -> "NeuralMix didn’t mix"
+        isNeuralMix && phase == BlendPhase.MIX_COMPLETED && activeTransitionStyle != TransitionStyle.HARMONIC_BEATMIX -> "NeuralMix · Not beat-mixed"
+        isNeuralMix && (phase == BlendPhase.ARMED || phase == BlendPhase.BLENDING) && activeTransitionStyle != TransitionStyle.HARMONIC_BEATMIX -> "NeuralMix · Fade"
+        else -> mixName
+    }
+
     val isBlendingActive: Boolean
         get() = phase == BlendPhase.BLENDING
 

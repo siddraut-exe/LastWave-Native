@@ -367,21 +367,67 @@ class MusicPlayer @Inject constructor(
     internal var radioQueueLoadJob: Job? = null
     private val radioQueueMutex = Mutex()
     internal var radioQueueActive = false
-    // Session-local ownership: only tracks appended by automatic radio may move.
-    // Manual edits invalidate all ownership conservatively; no restored queue is assumed automatic.
+    // A queue revision guards scans against manual edits and queue replacement.
+    // Retain provenance only for the optional automatic-recommendations-only scope.
     private val neuralRadioSongs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private var neuralQueueLocked = false
+
+    fun setNeuralQueueLocked(locked: Boolean) = onMain {
+        if (neuralQueueLocked != locked) {
+            neuralQueueLocked = locked
+            invalidateNeuralDjScan()
+        }
+    }
     private var neuralDjJob: Job? = null
     private var neuralDjAttempt: String? = null
+    private var neuralDjLastDiagnostic: String? = null
+    private var neuralDjLastTickMs = 0L
     private var neuralQueueRevision = 0L
+    private val _neuralQueueState = MutableStateFlow(com.lastwave.app.playback.automix.neuralmix.NeuralQueueState())
+    val neuralQueueState = _neuralQueueState.asStateFlow()
+    private val neuralOriginalPositions = linkedMapOf<String, Int>()
+    private var neuralPinnedNextKey: String? = null
+
+    internal fun neuralQueueKey(track: PlayableTrack): String = neuralSongKey(track)
+
+    private fun neuralQueueStatus(stage: String, examined: Int = 0, total: Int = 0,
+                                  priority: List<String> = emptyList(), committed: Boolean = false) {
+        val key = player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)
+        // No per-tick list walk: snapshot positions only on a new queue/cycle or scan.
+        val previous = _neuralQueueState.value
+        if (previous.currentKey != key || neuralOriginalPositions.isEmpty() || total > 0 && examined == 0) {
+            var ordinal = neuralOriginalPositions.values.maxOrNull() ?: 0
+            for (index in 0 until player.mediaItemCount) {
+                val song = neuralSongKey(player.getMediaItemAt(index).toPlayableTrack())
+                if (song !in neuralOriginalPositions) {
+                    ordinal = maxOf(ordinal + 1, index + 1)
+                    neuralOriginalPositions[song] = ordinal
+                }
+            }
+        }
+        _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState(
+            key, stage, examined, total, neuralOriginalPositions.toMap(), priority, committed,
+            previewDepth = autoMixCoordinator.get().djPriorityLimit().coerceAtLeast(0),
+        )
+    }
 
     private fun neuralSongKey(track: PlayableTrack): String = PureRadioQueue.normalizedSongKey(track.title, track.artist)
 
-    private fun invalidateNeuralQueueOwnership() {
+    private fun invalidateNeuralDjScan() {
         neuralQueueRevision++
-        neuralRadioSongs.clear()
         neuralDjJob?.cancel()
         neuralDjJob = null
         neuralDjAttempt = null
+        neuralDjLastDiagnostic = null
+        _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState()
+    }
+
+    private fun invalidateNeuralQueueOwnership() {
+        neuralRadioSongs.clear()
+        neuralOriginalPositions.clear()
+        neuralPinnedNextKey = null
+        _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState()
+        invalidateNeuralDjScan()
     }
     private val radioUsedSeeds = ConcurrentHashMap.newKeySet<String>()
     @Volatile
@@ -694,6 +740,33 @@ class MusicPlayer @Inject constructor(
     val usbDacState: StateFlow<UsbDacMonitor.State> = usbDacMonitor.state
     internal val resolvingMediaIds = ConcurrentHashMap<String, Long>()
     internal val preparedStreams = ConcurrentHashMap<String, ResolvedStream>()
+    private val neuralDeckRenditions = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Player, com.lastwave.app.playback.automix.neuralmix.NeuralRenditionRegistry<ResolvedStream>>()
+    )
+
+    private var neuralAnalysisItemCache: Triple<Player, MediaItem, MediaItem>? = null
+
+    /** Analysis-only MediaItem for the exact rendition chosen by this deck's loader.
+     * The playing timeline is never replaced to obtain an analysis key. */
+    private fun neuralAnalysisItem(deck: Player, item: MediaItem): MediaItem {
+        val uri = item.localConfiguration?.uri ?: return item
+        if (uri.scheme != "lastwave") return item
+        val observed = neuralDeckRenditions[deck]?.get(uri.toString()) ?: return item
+        val stream = preparedStreams[observed.cacheKey]?.takeIf { !it.isExpired() } ?: observed
+        if (stream.isExpired() || stream.segmentedDrm != null || !stream.mimeType.startsWith("audio/")) return item
+        if (item.mediaId == deck.currentMediaItem?.mediaId && deck.duration > 0L &&
+            stream.durationMs?.let { kotlin.math.abs(it - deck.duration) > 2_000L } == true) return item
+        // Keep the actual stream headers for the analysis data source. This is not a new
+        // playback resolution and must not publish metadata for another song.
+        preparedStreams.compute(stream.cacheKey) { _, old -> if (old == null || old.isExpired()) stream else old }
+        val cached = neuralAnalysisItemCache
+        if (cached != null && cached.first === deck && cached.second === item &&
+            cached.third.localConfiguration?.customCacheKey == stream.cacheKey &&
+            cached.third.localConfiguration?.uri?.toString() == stream.url) return cached.third
+        return item.buildUpon().setUri(Uri.parse(stream.url)).setCustomCacheKey(stream.cacheKey).setMimeType(stream.mimeType).build()
+            .also { neuralAnalysisItemCache = Triple(deck, item, it) }
+    }
+
 
     /**
      * Stream resolved for a track we are about to hand over to ExoPlayer, plus
@@ -1150,6 +1223,9 @@ class MusicPlayer @Inject constructor(
             neuralDjJob?.cancel()
             neuralDjJob = null
             neuralDjAttempt = null
+            neuralDjLastDiagnostic = null
+            neuralPinnedNextKey = null
+            _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState()
             recordLocalListenSignal(reason)
             // Settle target or sanitize raw position from ExoPlayer
             val rawPos = player.currentPosition.coerceAtLeast(0L)
@@ -1186,6 +1262,10 @@ class MusicPlayer @Inject constructor(
             val currentIndex = player.currentMediaItemIndex
             resetRenderWatchdog()
             val currentTrack = mediaItem.toPlayableTrack()
+            val missedNeuralMix = if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && outgoingPlayer == null &&
+                _state.value.current?.mediaIdKey()?.let { it != currentTrack.mediaIdKey() } == true) {
+                autoMixCoordinator.get().unmixedAdvanceReason()
+            } else null
             val currentQueue = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).toPlayableTrack() }
             // The stream we staged for this exact mediaId, if any. Taken
             // before the reset so the badge survives it.
@@ -1239,6 +1319,7 @@ class MusicPlayer @Inject constructor(
                     applyDacRoutingFor(currentSourceRateHz())
                 }
                 if (outgoingPlayer == null) cancelCrossfade()
+                missedNeuralMix?.let { autoMixCoordinator.get().reportUnmixedAdvance(it) }
                 // Queue placeholders are intentionally non-playable until
                 // their signed stream has been resolved. Resolve an item
                 // before Media3 can attempt to open its lastwave:// URI.
@@ -1607,6 +1688,7 @@ class MusicPlayer @Inject constructor(
         handleAudioFocus: Boolean = true,
     ): ExoPlayer {
         playbackBandwidthSampling.value
+        val observedRenditions = com.lastwave.app.playback.automix.neuralmix.NeuralRenditionRegistry<ResolvedStream>({ it.cacheKey })
         val resolving = ResolvingDataSource.Factory(cacheDataSourceFactory) { dataSpec ->
             val placeholder = dataSpec.uri.takeIf { it.scheme == "lastwave" }
             val resolvedPlaceholder = placeholder?.let { uri ->
@@ -1704,6 +1786,9 @@ class MusicPlayer @Inject constructor(
                 ?: preparedStreams.values.firstOrNull { it.url == dataSpec.uri.toString() }
             if (stream?.isExpired() == true) {
                 throw java.io.IOException("Signed stream expired before open")
+            }
+            if (placeholder != null && resolvedPlaceholder != null) {
+                observedRenditions.observe(placeholder.toString(), resolvedPlaceholder)
             }
             when {
                 resolvedPlaceholder != null -> dataSpec.buildUpon()
@@ -2016,6 +2101,7 @@ class MusicPlayer @Inject constructor(
                     }
                 })
             }.also { playerInstance ->
+                neuralDeckRenditions[playerInstance] = observedRenditions
                 builtSink?.let { s -> playerToSink[playerInstance] = s }
             }
     }
@@ -2114,6 +2200,8 @@ class MusicPlayer @Inject constructor(
         secondaryPlayer?.release()
         secondaryPlayer = null
         playerDelegate.reset()
+        neuralAnalysisItemCache = null
+        neuralDeckRenditions.clear()
     }
 
     init {
@@ -2302,7 +2390,9 @@ class MusicPlayer @Inject constructor(
                                     // A quality hot-swap is playing this same song on the standby.
                                     standby = currentStandby().takeUnless { hotSwapActive },
                                     current = _state.value.current,
-                                    currentItem = player.currentMediaItem,
+                                    currentItem = player.currentMediaItem?.let { item ->
+                                        if (autoMixCoordinator.get().neuralMixSelected()) neuralAnalysisItem(player, item) else item
+                                    },
                                     next = nextTrk,
                                     nextItem = nextItem,
                                     positionMs = runCatching { player.currentPosition }.getOrDefault(pos).coerceAtLeast(0L),
@@ -2873,6 +2963,7 @@ class MusicPlayer @Inject constructor(
             if (playerDelegate.isInitialized()) {
                 player.stop()
                 player.clearMediaItems()
+                neuralDeckRenditions[player]?.clear()
             }
             resetPlayhead(startPositionMs, selectedTrack.mediaIdKey())
             resetRenderWatchdog()
@@ -3113,6 +3204,11 @@ class MusicPlayer @Inject constructor(
             }
             persistPlaybackSession()
             return@onMain
+        }
+        if (autoMixCoordinator.get().neuralMixSelected()) {
+            releaseIdleStandby("User selected Play next")
+            cancelCrossfade()
+            neuralPinnedNextKey = neuralSongKey(enriched)
         }
         val wasEnded = player.playbackState == Player.STATE_ENDED
         val wasEmpty = player.mediaItemCount == 0
@@ -3543,9 +3639,7 @@ class MusicPlayer @Inject constructor(
         return _state.value.positionMs
     }
     fun seekTo(positionMs: Long) = onMain {
-        neuralDjJob?.cancel()
-        neuralDjJob = null
-        neuralDjAttempt = null
+        invalidateNeuralDjScan()
         zeroVolumePlaybackObserver.onManualAction()
         if (isCasting) {
             castPlayback?.seek(positionMs.coerceAtLeast(0))
@@ -3959,8 +4053,8 @@ class MusicPlayer @Inject constructor(
     fun toggleShuffle() = setShuffleEnabled(!state.value.shuffleEnabled)
 
     fun setShuffleEnabled(enabled: Boolean) = onMain {
-        invalidateNeuralQueueOwnership()
         if (isCasting) {
+            invalidateNeuralDjScan()
             _state.update { it.copy(shuffleEnabled = enabled) }
             persistPlaybackSession()
             return@onMain
@@ -3970,6 +4064,8 @@ class MusicPlayer @Inject constructor(
         // leaves a stale state flag behind â€” the toggle then visibly flips
         // back ("unsuffles itself") on the next event.
         if (player.shuffleModeEnabled == enabled && _state.value.shuffleEnabled == enabled) return@onMain
+        // Shuffle changes play order, not which songs came from radio.
+        invalidateNeuralDjScan()
         cancelCrossfade()
         if (enabled && player.mediaItemCount > 1) {
             reshuffleFrom(player.currentMediaItemIndex.takeIf { it in 0 until player.mediaItemCount } ?: 0)
@@ -4179,6 +4275,10 @@ class MusicPlayer @Inject constructor(
             persistPlaybackSession()
             return@onMain
         }
+        if (autoMixCoordinator.get().neuralMixSelected()) {
+            releaseIdleStandby("Manual queue insertion")
+            cancelCrossfade()
+        }
         val safeIndex = index.coerceIn(0, player.mediaItemCount)
         player.addMediaItem(safeIndex, enriched.toMediaItem())
         refresh(player)
@@ -4229,7 +4329,15 @@ class MusicPlayer @Inject constructor(
             return@onMain
         }
         if (fromIndex in 0 until player.mediaItemCount && toIndex in 0 until player.mediaItemCount) {
+            if (autoMixCoordinator.get().neuralMixSelected()) {
+                releaseIdleStandby("Manual queue move")
+                cancelCrossfade()
+            }
             player.moveMediaItem(fromIndex, toIndex)
+            if (autoMixCoordinator.get().neuralMixSelected()) {
+                refresh(player)
+                persistPlaybackSession()
+            }
         }
     }
     fun clearError() = _state.update { it.copy(error = null) }
@@ -5085,72 +5193,146 @@ class MusicPlayer @Inject constructor(
         }
     }
 
+    /** Prefer exact container timing; resolved duration is safe for this particular rendition. */
+    private fun neuralDjDuration(): Long = player.duration.takeIf { it > 0L }
+        ?: player.currentMediaItem?.localConfiguration?.customCacheKey
+            ?.let(preparedStreams::get)?.durationMs?.takeIf { it > 0L } ?: 0L
+
+    private fun neuralDjDiagnostic(reason: String) {
+        val key = "${player.currentMediaItemIndex}:${player.currentMediaItem?.mediaId}:$reason"
+        if (key == neuralDjLastDiagnostic) return
+        neuralDjLastDiagnostic = key
+        Log.i("NeuralMixDJ", reason)
+        if (!_neuralQueueState.value.committed || _neuralQueueState.value.currentKey !=
+            player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) neuralQueueStatus(reason)
+    }
+
     /** Main-thread snapshot; background resolution never changes the live queue. */
     private fun maybeScheduleNeuralDj() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - neuralDjLastTickMs < 500L) return
+        neuralDjLastTickMs = now
         val coordinator = autoMixCoordinator.get()
-        if (!radioQueueActive || !autoplaySimilarEnabled || !coordinator.intelligentDjActive() ||
-            bitPerfectEnabled || isCasting || player.shuffleModeEnabled ||
-            player.repeatMode == Player.REPEAT_MODE_ONE || !player.isPlaying || hotSwapActive ||
-            coordinator.isBlending || outgoingPlayer != null) {
+        val blocked = when {
+            !coordinator.intelligentDjActive() -> "DJ disabled or audio route blocked"
+            neuralQueueLocked -> "Queue locked by user"
+            !coordinator.djAllQueues() && !radioQueueActive -> "Automatic-only scope · waiting for radio"
+            bitPerfectEnabled || isCasting || exclusiveUsbOutput.isActive() || internalDirectOutput.isActive() -> "Direct audio or Cast active"
+            player.shuffleModeEnabled -> "Turn off normal shuffle for NeuralMix ordering"
+            player.repeatMode == Player.REPEAT_MODE_ONE -> "Repeat one enabled"
+            !player.playWhenReady -> "Playback paused"
+            hotSwapActive -> "Audio rendition changing"
+            coordinator.isBlending || outgoingPlayer != null -> "Transition already active"
+            else -> null
+        }
+        if (blocked != null) {
+            if (coordinator.intelligentDjRequested()) neuralDjDiagnostic(blocked)
             if (neuralDjJob?.isActive == true) {
                 neuralDjJob?.cancel()
                 neuralDjAttempt = null
             }
+            if (!coordinator.intelligentDjRequested()) {
+                neuralDjAttempt = null
+                if (coordinator.neuralMixSelected()) {
+                    if (_neuralQueueState.value.stage != "Intelligent DJ disabled" ||
+                        _neuralQueueState.value.currentKey != player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) {
+                        neuralQueueStatus("Intelligent DJ disabled", committed = true)
+                    }
+                } else if (_neuralQueueState.value.currentKey != null) {
+                    _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState()
+                }
+            }
             return
         }
         val schedule = com.lastwave.app.playback.automix.neuralmix.NeuralDjSchedule
-        val duration = player.duration
+        val duration = neuralDjDuration()
         val position = player.currentPosition
-        if (!schedule.canStart(position, duration) || neuralDjJob?.isActive == true) return
-        val current = player.currentMediaItem ?: return
+        if (neuralDjJob?.isActive == true) return
+        if (_neuralQueueState.value.committed && _neuralQueueState.value.stage != "Intelligent DJ disabled" && _neuralQueueState.value.currentKey ==
+            player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) return
+        if (!schedule.canPrepare(position, duration)) {
+            neuralDjDiagnostic(when {
+                duration <= 0L -> "Waiting for reliable track duration"
+                position < duration / 4 -> "Waiting for analysis preparation window"
+                else -> "Preparation deadline reached"
+            })
+            return
+        }
+        val liveCurrent = player.currentMediaItem ?: return
+        val current = neuralAnalysisItem(player, liveCurrent)
         val currentTrack = current.toPlayableTrack()
-        if (currentTrack.mediaType != MediaType.SONG) return
+        if (currentTrack.mediaType != MediaType.SONG) {
+            neuralDjDiagnostic("Current media is not a song")
+            return
+        }
         val userParameters = coordinator.userParametersFor(player) ?: player.playbackParameters
-        if (userParameters.speed != 1f || userParameters.pitch != 1f) return
+        if (userParameters.speed != 1f || userParameters.pitch != 1f) {
+            neuralDjDiagnostic("Custom speed or pitch active")
+            return
+        }
         val currentIndex = player.currentMediaItemIndex
         val nextIndex = player.nextMediaItemIndex
-        if (nextIndex != currentIndex + 1 || nextIndex !in 0 until player.mediaItemCount) return
+        if (nextIndex != currentIndex + 1 || nextIndex !in 0 until player.mediaItemCount) {
+            neuralDjDiagnostic("No sequential upcoming track")
+            return
+        }
+        if (neuralPinnedNextKey == neuralSongKey(player.getMediaItemAt(nextIndex).toPlayableTrack())) {
+            neuralDjDiagnostic("Explicit Play next is pinned for this transition")
+            return
+        }
         val generation = playRequestGeneration.get()
         val revision = neuralQueueRevision
         val currentKey = com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator.analysisKey(current)
-        val attempt = "$generation:$revision:$currentIndex:$currentKey"
-        if (neuralDjAttempt == attempt) return
-        // Only a contiguous automatic prefix can move. Never cross a manual item.
         val limit = coordinator.freshDjLimit()
+        val depth = coordinator.djPriorityLimit()
+        val allQueues = coordinator.djAllQueues()
+        val attempt = "$generation:$revision:$currentIndex:$currentKey:$limit:$depth:$allQueues"
+        if (neuralDjAttempt == attempt) return
+        // Intelligent DJ is explicitly enabled for the active queue, regardless of its origin.
+        // Do not cross an unavailable/non-song boundary or move the current/played prefix.
         val upcoming = (nextIndex until minOf(player.mediaItemCount, nextIndex + limit))
             .map(player::getMediaItemAt)
-            .takeWhile { neuralSongKey(it.toPlayableTrack()) in neuralRadioSongs && it.mediaId !in unavailableMediaIds }
-        if (upcoming.size < 2) return
+            .takeWhile { it.toPlayableTrack().mediaType == MediaType.SONG &&
+                (allQueues || neuralSongKey(it.toPlayableTrack()) in neuralRadioSongs) }
+        if (upcoming.size < 2) {
+            neuralDjDiagnostic("Only ${upcoming.size} eligible upcoming songs")
+            return
+        }
         val keys = upcoming.map { neuralSongKey(it.toPlayableTrack()) }
-        if (keys.distinct().size != keys.size) return
-        val currentInput = autoMixAnalysisInput(current) ?: return
+        val currentInput = autoMixAnalysisInput(current) ?: run {
+            neuralDjDiagnostic("Current stream cannot be decoded for analysis")
+            return
+        }
         neuralDjAttempt = attempt
         val activeDeck = player
         val quality = selectedStreamingQuality(latestPlaybackSettings)
         val preferLossless = latestPlaybackSettings.preferLosslessStreaming
         val budget = (duration - position - schedule.LOCK_REMAINING_MS - 5_000L).coerceAtMost(90_000L)
-        Log.i("NeuralMixDJ", "Scanning ${upcoming.size} candidates at ${position}ms; budget=${budget}ms")
+        neuralQueueStatus("Analyzing current song outro", total = upcoming.size)
+        Log.i("NeuralMixDJ", "Scanning ${upcoming.size} candidates for '${currentTrack.title}' at ${position}ms; duration=${duration}ms; budget=${budget}ms")
 
         // Recheck every assumption after suspending. A skip, queue edit, source swap,
         // mode change or approaching transition invalidates the result.
         fun valid(): Boolean {
             if (playRequestGeneration.get() != generation || neuralQueueRevision != revision ||
-                !radioQueueActive || !autoplaySimilarEnabled || !coordinator.intelligentDjActive() ||
-                isCasting || bitPerfectEnabled || player !== activeDeck || hotSwapActive ||
+                !coordinator.intelligentDjActive() || neuralQueueLocked ||
+                coordinator.djAllQueues() != allQueues || coordinator.djPriorityLimit() != depth ||
+                (!allQueues && !radioQueueActive) ||
+                isCasting || bitPerfectEnabled || exclusiveUsbOutput.isActive() || internalDirectOutput.isActive() || player !== activeDeck || hotSwapActive ||
                 coordinator.isBlending || outgoingPlayer != null || player.shuffleModeEnabled ||
-                player.repeatMode == Player.REPEAT_MODE_ONE || !player.isPlaying ||
+                player.repeatMode == Player.REPEAT_MODE_ONE || !player.playWhenReady ||
                 player.currentMediaItemIndex != currentIndex || player.nextMediaItemIndex != nextIndex ||
-                !schedule.canCommit(player.currentPosition, player.duration) ||
+                !schedule.canContinue(player.currentPosition, neuralDjDuration()) || coordinator.freshDjLimit() != limit ||
                 nextIndex + keys.size > player.mediaItemCount ||
                 selectedStreamingQuality(latestPlaybackSettings) != quality ||
                 latestPlaybackSettings.preferLosslessStreaming != preferLossless) return false
             val item = player.currentMediaItem ?: return false
-            if (com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator.analysisKey(item) != currentKey) return false
+            if (com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator.analysisKey(neuralAnalysisItem(player, item)) != currentKey) return false
             val params = coordinator.userParametersFor(player) ?: player.playbackParameters
             if (params.speed != 1f || params.pitch != 1f) return false
             return keys.indices.all { i ->
                 val candidate = player.getMediaItemAt(nextIndex + i)
-                neuralSongKey(candidate.toPlayableTrack()) == keys[i] && keys[i] in neuralRadioSongs && candidate.mediaId !in unavailableMediaIds
+                neuralSongKey(candidate.toPlayableTrack()) == keys[i] && (allQueues || keys[i] in neuralRadioSongs)
             }
         }
 
@@ -5158,6 +5340,7 @@ class MusicPlayer @Inject constructor(
             val scores = MutableList<Double?>(upcoming.size) { null }
             val analysedItems = arrayOfNulls<MediaItem>(upcoming.size)
             val resolvedStreams = arrayOfNulls<ResolvedStream>(upcoming.size)
+            val analysisInputs = arrayOfNulls<com.lastwave.app.playback.automix.analysis.AnalysisInput>(upcoming.size)
             try {
                 withTimeoutOrNull(budget) {
                     val outKey = coordinator.requestDjAnalysis(currentTrack, current, currentInput) ?: return@withTimeoutOrNull
@@ -5169,88 +5352,183 @@ class MusicPlayer @Inject constructor(
                     }
                     for (i in upcoming.indices) {
                         if (!valid()) break
+                        neuralQueueStatus("Resolving and analyzing candidate ${i + 1}", i, upcoming.size)
                         val item = player.getMediaItemAt(nextIndex + i)
                         val track = item.toPlayableTrack()
+                        if (item.mediaId in unavailableMediaIds || keys[i] == neuralSongKey(currentTrack) || keys.indexOf(keys[i]) != i) {
+                            Log.i("NeuralMixDJ", "Candidate ${i + 1}: unavailable or repeated song")
+                            continue
+                        }
                         val input = autoMixAnalysisInput(item)
                         var ready = item
                         var source = input
                         if (source == null && item.localConfiguration?.uri?.scheme == "lastwave") {
                             val misc = latestPlaybackSettings
-                            val resolved = withTimeoutOrNull(12_000L) {
+                            fun analysable(stream: ResolvedStream): Boolean =
+                                !stream.isExpired() && stream.segmentedDrm == null &&
+                                    stream.mimeType.startsWith("audio/") && isStreamAllowedForQuality(stream, quality, misc)
+                            val resolved = withTimeoutOrNull(16_000L) {
                                 withContext(Dispatchers.IO) {
-                                    // Don't force YouTube into a queue whose user selected a lossless provider.
-                                    if (misc.preferLosslessStreaming && quality != LosslessMusicApi.QUALITY_YOUTUBE) {
-                                        try {
-                                            resolveLosslessTrackAudioStream(track, misc,
-                                                expectedDurationSeconds = track.durationMs?.takeIf { it > 0 }?.div(1_000)?.toInt(),
-                                                requestedQuality = quality)
-                                        } catch (cancelled: CancellationException) {
-                                            throw cancelled
-                                        } catch (error: Exception) {
-                                            Log.d("NeuralMixDJ", "Preferred provider candidate unavailable", error)
-                                            null
+                                    val bypassLossless = track.mediaIdKey() in losslessBypassMediaIds
+                                    val prepared = findPreparedStreamFor(track, track.videoId, bypassLossless, quality)
+                                        ?.takeIf(::analysable)
+                                    if (prepared != null) return@withContext prepared
+                                    val local = resolveLocalDownloadedAudioStream(track, deepScan = false)?.takeIf(::analysable)
+                                    if (local != null) return@withContext local
+                                    // Mirror normal preload: try the preferred provider, then a
+                                    // policy-allowed YouTube fallback if it cannot supply analysable audio.
+                                    // Never replace an already resolved protected rendition for analysis.
+                                    val preferred = if (!bypassLossless && misc.preferLosslessStreaming &&
+                                        quality != LosslessMusicApi.QUALITY_YOUTUBE && !losslessMusicApi.isCoolingDown) {
+                                        withTimeoutOrNull(8_000L) {
+                                            try {
+                                                resolveLosslessTrackAudioStream(track, misc,
+                                                    expectedDurationSeconds = track.durationMs?.takeIf { it > 0 }?.div(1_000)?.toInt(),
+                                                    requestedQuality = quality)
+                                            } catch (cancelled: CancellationException) {
+                                                throw cancelled
+                                            } catch (error: Exception) {
+                                                Log.d("NeuralMixDJ", "Preferred provider candidate unavailable", error)
+                                                null
+                                            }
                                         }
-                                    } else resolvePreloadYoutube(track, quality)
+                                    } else null
+                                    preferred?.takeIf(::analysable) ?: resolvePreloadYoutube(track, quality)?.takeIf(::analysable)
                                 }
-                            } ?: continue
+                            }
+                            if (resolved == null) {
+                                Log.i("NeuralMixDJ", "Candidate ${i + 1}: no analysable policy-allowed rendition or resolution timed out")
+                                continue
+                            }
                             if (!valid() || resolved.isExpired() || resolved.segmentedDrm != null ||
                                 !resolved.mimeType.startsWith("audio/") ||
-                                !isStreamAllowedForQuality(resolved, quality, latestPlaybackSettings)) continue
+                                !isStreamAllowedForQuality(resolved, quality, latestPlaybackSettings)) {
+                                Log.i("NeuralMixDJ", "Candidate ${i + 1}: rendition rejected")
+                                continue
+                            }
                             ready = track.toMediaItem(resolved)
                             val spec = DataSpec.Builder().setUri(resolved.url).setKey(resolved.cacheKey).build()
-                            source = com.lastwave.app.playback.automix.analysis.AnalysisInput(cacheDataSourceFactory, spec.withRequestHeaders(mediaRequestHeaders(resolved)))
+                            val scheme = Uri.parse(resolved.url).scheme
+                            source = if (scheme == "http" || scheme == "https") {
+                                com.lastwave.app.playback.automix.analysis.AnalysisInput(cacheDataSourceFactory, spec.withRequestHeaders(mediaRequestHeaders(resolved)))
+                            } else {
+                                com.lastwave.app.playback.automix.analysis.AnalysisInput(androidx.media3.datasource.DefaultDataSource.Factory(appContext), spec)
+                            }
                             resolvedStreams[i] = resolved
                         }
                         if (source == null) {
                             Log.i("NeuralMixDJ", "Candidate ${i + 1}: unsupported or unresolved input")
                             continue
                         }
+                        analysisInputs[i] = source
                         val key = coordinator.requestDjAnalysis(track, ready, source, introOnly = true) ?: break
                         // One decode at a time; a per-candidate limit prevents a bad stream
                         // monopolizing the whole scheduler. A partial scan may still win.
-                        withTimeoutOrNull(19_000L) {
+                        withTimeoutOrNull(34_000L) {
                             while (valid() && !coordinator.djAnalysisSettled(key, introOnly = true)) delay(200L)
                         }
                         if (!valid()) break
                         scores[i] = coordinator.djCandidateScore(current, ready, duration)
                         analysedItems[i] = ready
-                        Log.i("NeuralMixDJ", "Candidate ${i + 1}: ${coordinator.djAnalysisStatus(key, introOnly = true)}, feasibleScore=${scores[i]}")
+                        Log.i("NeuralMixDJ", "Candidate ${i + 1}: ${coordinator.djAnalysisStatus(key, introOnly = true)}, rank=${scores[i]}")
+                        neuralQueueStatus("Candidate analysis", i + 1, upcoming.size)
                         if (!coordinator.djAnalysisSettled(key, introOnly = true)) break // don't queue more work behind a stalled decode
                     }
+                    // Intro scans are cheap; only extend a few promising candidates to full
+                    // signatures, reusing their intros, when time remains for a real chain.
+                    val promising = scores.indices.filter { (scores[it] ?: 0.0) >= 40.0 }
+                        .sortedByDescending { scores[it] }.take((depth - 1).coerceAtLeast(0))
+                    for (i in promising) {
+                        if (!valid() || duration - player.currentPosition < schedule.LOCK_REMAINING_MS + 35_000L) break
+                        val ready = analysedItems[i] ?: continue
+                        val source = analysisInputs[i] ?: continue
+                        neuralQueueStatus("Analyzing candidate outros for sequence", scores.count { it != null }, upcoming.size)
+                        val key = coordinator.requestDjAnalysis(ready.toPlayableTrack(), ready, source) ?: break
+                        withTimeoutOrNull(18_000L) {
+                            while (valid() && !coordinator.djAnalysisSettled(key)) delay(200L)
+                        }
+                        if (!coordinator.djAnalysisSettled(key)) break
+                    }
                 }
-                if (!valid()) return@launch
-                val winner = schedule.winner(scores) ?: run {
-                    Log.i("NeuralMixDJ", "No feasible analysed candidate; keeping queue order")
+                Log.i("NeuralMixDJ", "Scan results: $scores")
+                if (!valid()) {
+                    neuralDjDiagnostic("Scan discarded: queue, playback, rendition or deadline changed")
                     return@launch
                 }
-                if (winner == 0) {
-                    Log.i("NeuralMixDJ", "Original next track already best")
+                neuralQueueStatus("Ranking candidates · ${scores.count { it != null }} scored", scores.count { it != null }, upcoming.size)
+                // A quick cached scan may finish early. Defer its result until the midpoint.
+                while (valid() && !schedule.canCommit(player.currentPosition, neuralDjDuration())) delay(200L)
+                if (!valid() || !schedule.canCommit(player.currentPosition, neuralDjDuration())) {
+                    neuralDjDiagnostic("Prepared scan expired before midpoint commit")
                     return@launch
                 }
+                // Re-score any rendition changed by ordinary preloading. Never bind a
+                // fingerprint to a different edit or force a lower-quality stream.
+                fun keyOf(item: MediaItem) = com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator.analysisKey(item)
+                for (i in scores.indices) {
+                    val ready = analysedItems[i] ?: continue
+                    val live = player.getMediaItemAt(nextIndex + i)
+                    if (live.mediaId in unavailableMediaIds) {
+                        scores[i] = null
+                        analysedItems[i] = null
+                        continue
+                    }
+                    if (keyOf(live) != keyOf(ready) && live.localConfiguration?.uri?.scheme != "lastwave") {
+                        scores[i] = coordinator.djCandidateScore(current, live, duration)
+                        analysedItems[i] = live
+                        resolvedStreams[i] = null
+                    }
+                }
+                val optimizer = com.lastwave.app.playback.automix.neuralmix.NeuralQueueOptimizer
+                val chain = optimizer.chain(scores, depth = depth) { from, to ->
+                    val a = analysedItems[from]
+                    val b = analysedItems[to]
+                    if (a == null || b == null || keys[from] == keys[to]) null else coordinator.djSequenceScore(a, b)
+                }
+                if (chain.isEmpty()) {
+                    neuralQueueStatus("No reliable match · keeping queue order", scores.count { it != null }, upcoming.size, committed = true)
+                    Log.i("NeuralMixDJ", "No sufficiently compatible analysed candidate; keeping queue order")
+                    return@launch
+                }
+                val winner = chain.first()
                 val index = nextIndex + winner
                 val ready = analysedItems[winner] ?: return@launch
                 val live = player.getMediaItemAt(index)
-                // If a normal preload changed the rendition, don't reuse analysis for a different stream.
                 val resolved = resolvedStreams[winner]
-                fun keyOf(item: MediaItem) = com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator.analysisKey(item)
                 if (keyOf(live) != keyOf(ready)) {
-                    if (resolved == null || resolved.isExpired() || live.localConfiguration?.uri?.scheme != "lastwave") return@launch
-                    if (publishNextPreparedStream(index, live.mediaId, resolved) == null) return@launch
-                    if (keyOf(player.getMediaItemAt(index)) != keyOf(ready)) return@launch
+                    if (resolved == null || resolved.isExpired() || live.localConfiguration?.uri?.scheme != "lastwave" ||
+                        publishNextPreparedStream(index, live.mediaId, resolved) == null ||
+                        keyOf(player.getMediaItemAt(index)) != keyOf(ready)) {
+                        neuralDjDiagnostic("Selected stream changed; keeping queue order")
+                        return@launch
+                    }
                 }
-                if (!valid()) return@launch
-                // Cancel the stale next-item preload and force the standby to mirror the new order.
-                preloadJob?.cancel()
-                preloadJob = null
-                cancelCrossfade()
-                player.moveMediaItem(index, nextIndex)
-                refresh(player)
-                persistPlaybackSession()
-                preloadNextQueueItem(currentIndex)
-                Log.i("NeuralMixDJ", "Promoted candidate ${winner + 1}: '${ready.mediaMetadata.title}', score=${scores[winner]}")
+                if (!valid()) {
+                    neuralDjDiagnostic("Queue changed while preparing selected stream")
+                    return@launch
+                }
+                val moves = optimizer.moves(upcoming.size, chain)
+                if (moves.isNotEmpty()) {
+                    // Main-thread transaction: no suspensions between validation and moves.
+                    preloadJob?.cancel()
+                    preloadJob = null
+                    if (!releaseIdleStandby("NeuralMix queue order changed")) {
+                        neuralDjDiagnostic("Standby busy; keeping queue order")
+                        return@launch
+                    }
+                    cancelCrossfade()
+                    for ((from, to) in moves) player.moveMediaItem(nextIndex + from, nextIndex + to)
+                    refresh(player)
+                    persistPlaybackSession()
+                    preloadNextQueueItem(currentIndex)
+                }
+                neuralQueueStatus(if (moves.isEmpty()) "Best sequence already next" else "Queue optimized · preparing transition",
+                    scores.count { it != null }, upcoming.size, chain.map { keys[it] }, committed = true)
+                Log.i("NeuralMixDJ", "Committed priority sequence $chain; scores=$scores; moves=$moves")
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                neuralDjDiagnostic("Candidate scan failed; keeping normal playback")
                 Log.w("NeuralMixDJ", "Candidate scan failed; keeping normal playback", error)
             }
         }

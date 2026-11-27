@@ -56,7 +56,7 @@ fun AudioQualityMixBadge(
             BlendPhase.BLENDING -> {
                 val bpmText = telemetry.syncedBpm?.let { "${it.toInt()} BPM" } ?: ""
                 val mixingText = buildString {
-                    append("AutoMix")
+                    append(telemetry.mixName)
                     if (bpmText.isNotEmpty()) append(" \u2022 ").append(bpmText)
                 }
 
@@ -88,7 +88,10 @@ fun AudioQualityMixBadge(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Mixed ✓$bpmText",
+                        text = if (telemetry.isNeuralMix)
+                            if (telemetry.activeTransitionStyle == com.lastwave.app.playback.automix.api.TransitionStyle.HARMONIC_BEATMIX)
+                                "NeuralMix · Mixed$bpmText" else "NeuralMix · Not beat-mixed"
+                        else "Mixed ✓$bpmText",
                         style = MaterialTheme.typography.labelSmall.copy(
                             fontSize = 10.sp,
                             fontWeight = FontWeight.SemiBold,

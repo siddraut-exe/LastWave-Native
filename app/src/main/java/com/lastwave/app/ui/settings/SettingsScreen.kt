@@ -2788,7 +2788,18 @@ fun SettingsScreen(
                     }
                     TextButton(onClick = { showNeuralQuality = false }) { Text("Back to NeuralMix") }
                 } else {
-                    NeuralMixSheetToggle("Intelligent DJ", "At mid-playback, compare upcoming radio tracks and promote a compatible next track. Manual queues are protected.", hfSettings.intelligentDjEnabled, viewModel::setIntelligentDjEnabled)
+                    NeuralMixSheetToggle("Intelligent DJ", "Prepare candidates at 25% playback and optimize the upcoming order after the midpoint. Applies to the active queue, including playlists; saved playlist order is unchanged. Turn off normal shuffle for NeuralMix ordering.", hfSettings.intelligentDjEnabled, viewModel::setIntelligentDjEnabled)
+                    NeuralMixSheetToggle("Optimize all playback queues", "Include search, normal queues and saved playlists. Off limits optimization to automatic radio additions.", hfSettings.neuralAllQueues, viewModel::setNeuralAllQueues)
+                    Text("Priority queue size", style = MaterialTheme.typography.titleMedium)
+                    Text("Maximum verified upcoming matches; the current song is shown separately. Analysis quality and available time may reduce the number.", style = MaterialTheme.typography.bodySmall)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                        listOf(3, 5, 8).forEach { count ->
+                            Row(Modifier.clickable { viewModel.setNeuralPriorityTracks(count) }, verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = hfSettings.neuralPriorityTracks == count, onClick = { viewModel.setNeuralPriorityTracks(count) })
+                                Text(count.toString())
+                            }
+                        }
+                    }
                     NeuralMixSheetToggle("Smart bass exchange", "Reduce bass overlap during NeuralMix transitions.", hfSettings.neuralBass, viewModel::setNeuralBass)
                     NeuralMixSheetToggle("Vocal protection", "Use synced lyrics to reduce overlapping vocal lines when available.", hfSettings.neuralVocals, viewModel::setNeuralVocals)
                     SettingsActionCard(
@@ -2803,7 +2814,7 @@ fun SettingsScreen(
                         },
                         onClick = { showNeuralQuality = true },
                     )
-                    Text("Analysis runs in the background. Unsupported streams or uncertain rhythms use a conservative fade.", style = MaterialTheme.typography.bodySmall)
+                    Text("The queue shows real analysis progress and verified priority tracks. Unsupported streams or uncertain rhythms keep a safe fallback. Normal shuffle, repeat-one, Cast and Bit-Perfect suspend DJ optimization.", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

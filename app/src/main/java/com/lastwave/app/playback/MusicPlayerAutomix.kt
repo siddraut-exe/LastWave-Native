@@ -222,7 +222,14 @@ internal fun MusicPlayer.armCrossfadeStandby(nextIndex: Int, nextItem: MediaItem
             standby.currentMediaItemIndex == nextIndex &&
             standby.currentMediaItem?.mediaId == nextItem.mediaId &&
             standby.currentMediaItem?.localConfiguration?.customCacheKey == nextItem.localConfiguration?.customCacheKey &&
-            standby.playbackState != Player.STATE_IDLE
+            standby.playbackState != Player.STATE_IDLE &&
+            // The first track can stay unchanged while NeuralMix reorders the future tail.
+            (!autoMixCoordinator.get().neuralMixSelected() || standbyQueue.indices.all { i ->
+                val a = standby.getMediaItemAt(i)
+                val b = standbyQueue[i]
+                a.mediaId == b.mediaId && a.localConfiguration?.customCacheKey == b.localConfiguration?.customCacheKey &&
+                    a.localConfiguration?.uri == b.localConfiguration?.uri
+            })
         if (!isAlreadySet) {
             standby.pause()
             // The sink still holds the rate routed for the playing track, and
@@ -505,7 +512,7 @@ internal fun MusicPlayer.updateBitPerfectState() {
         } ?: true
         secondaryEffects?.setBitPerfectActive(effectiveBitPerfect)
         nativeBitPerfectApplied = primaryOk && secondaryOk
-        autoMixCoordinator.get().updateHardwareBypassState(effectiveBitPerfect || exclusiveUsbOutput.isActive(), bitPerfectEnabled)
+        autoMixCoordinator.get().updateHardwareBypassState(effectiveBitPerfect || exclusiveUsbOutput.isActive() || internalDirectOutput.isActive(), bitPerfectEnabled)
         android.util.Log.i(
             "MusicPlayer",
             "BIT-PERFECT REQUEST enabled=$effectiveBitPerfect nativeApplied=$nativeBitPerfectApplied " +

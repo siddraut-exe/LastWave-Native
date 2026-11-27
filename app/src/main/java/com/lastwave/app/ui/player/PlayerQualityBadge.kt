@@ -416,17 +416,21 @@ internal fun AppleMusicQualityBadge(
         }
     }
     val isMixActive = mixAvailable
+    val neuralBypass = state.deckBlendTelemetry.isNeuralMix && state.deckBlendTelemetry.noMixReason != null &&
+        (state.deckBlendTelemetry.noMixCompleted || (progress.value.durationMs > 0L &&
+            progress.value.durationMs - progress.value.positionMs in 0L..25_000L))
     val isFadeActive = !mixAvailable && shownTransition == BadgeTransition.FADE
 
     val displayTitle = when {
-        isMixActive -> "AutoMix"
+        isMixActive -> autoMixUi.shownTelemetry(state.deckBlendTelemetry, trackKey).mixStatusLabel
+        neuralBypass -> state.deckBlendTelemetry.mixStatusLabel
         isFadeActive -> "Crossfade"
         switch != null -> (if (switch.upgrade) "Upgrading to " else "Switching to ") + switch.title
         else -> qualityTitle(state.audioCodec, state.isLossless, state.samplingRateKHz, state.bitDepth)
     }
 
     val badgeIcon = when {
-        isMixActive -> QualityGlyphs.AutoMix
+        isMixActive || neuralBypass -> QualityGlyphs.AutoMix
         isFadeActive -> QualityGlyphs.Crossfade
         switch != null -> if (switch.upgrade) Icons.Filled.ArrowUpward else Icons.Filled.ArrowDownward
         isSpatial -> QualityGlyphs.Spatial
@@ -530,7 +534,7 @@ internal fun AppleMusicQualityBadge(
             )
             Spacer(Modifier.width(androidx.compose.ui.unit.lerp(4.dp, 5.dp, mix)))
             val fullText = when {
-                isMixActive || isFadeActive || switch != null -> displayTitle
+                isMixActive || neuralBypass || isFadeActive || switch != null -> displayTitle
                 baseLabel.isNotBlank() && !baseLabel.equals(displayTitle, ignoreCase = true) && !baseLabel.equals("AUDIO", ignoreCase = true) -> "$displayTitle \u2022 $baseLabel"
                 else -> displayTitle
             }

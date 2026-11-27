@@ -98,7 +98,7 @@ internal class AutoMixPopupState {
     fun shownTelemetry(live: DeckBlendTelemetry, trackKey: String): DeckBlendTelemetry {
         val completed = completedTelemetry
         return if (completed != null && completedTrack == trackKey &&
-            live.phase != BlendPhase.BLENDING &&
+            completed.engine == live.engine && live.phase != BlendPhase.BLENDING &&
             SystemClock.uptimeMillis() - completedAtMs < POST_ROLL_MS
         ) completed else live
     }
@@ -146,12 +146,12 @@ internal fun AutoMixPopupHost(
     player: MusicPlayer,
     tracks: List<PlayableTrack>,
 ) {
-    LaunchedEffect(telemetry.phase, telemetry.view, trackKey) {
+    LaunchedEffect(telemetry.phase, telemetry.view, telemetry.engine, trackKey) {
         if (telemetry.phase == BlendPhase.BLENDING) {
             ui.observedCompletion = null
             ui.clearCompleted()
         }
-        if (ui.completedTrack != null && ui.completedTrack != trackKey) ui.clearCompleted()
+        if (ui.completedTrack != null && (ui.completedTrack != trackKey || ui.completedTelemetry?.engine != telemetry.engine)) ui.clearCompleted()
         if (telemetry.phase == BlendPhase.MIX_COMPLETED && telemetry.view != null &&
             ui.observedCompletion != telemetry.view &&
             trackKey.endsWith("\u0000${telemetry.view.incoming.title}\u0000${telemetry.view.incoming.artist}")
@@ -280,7 +280,7 @@ internal fun AutoMixPopupHost(
                                 clipPath(mask) { this@drawWithContent.drawContent() }
                             }
                             .pointerInput(Unit) { detectTapGestures { } }
-                            .semantics { paneTitle = "AutoMix" },
+                            .semantics { paneTitle = presented.mixName },
                         shape = RoundedCornerShape(24.dp),
                         color = StudioSurface,
                     ) {
@@ -290,7 +290,7 @@ internal fun AutoMixPopupHost(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    "AUTOMIX",
+                                    presented.mixName.uppercase(),
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         fontSize = 14.sp,
                                         fontWeight = FontWeight.Black,
@@ -303,7 +303,7 @@ internal fun AutoMixPopupHost(
                                 IconButton(onClick = ui::dismiss) {
                                     Icon(
                                         Icons.Filled.Close,
-                                        contentDescription = "Close AutoMix",
+                                        contentDescription = "Close ${presented.mixName}",
                                         tint = StudioContent.copy(alpha = 0.7f),
                                         modifier = Modifier.size(20.dp),
                                     )
@@ -355,9 +355,13 @@ private fun AutoMixPopupContent(
     }
     val seconds = ((view.cueOutMs - progress.positionMs) / 1_000L).coerceAtLeast(0L)
     val status = when (telemetry.phase) {
-        BlendPhase.BLENDING -> "Live \u2022 $kind"
-        BlendPhase.MIX_COMPLETED -> "Mix complete"
-        else -> "$kind in ${seconds / 60}:${"%02d".format(seconds % 60)}"
+        BlendPhase.BLENDING -> if (view.neuralMode && view.style != TransitionStyle.HARMONIC_BEATMIX)
+            "Fallback live · $kind" else "Live \u2022 $kind"
+        BlendPhase.MIX_COMPLETED -> if (view.neuralMode && view.style != TransitionStyle.HARMONIC_BEATMIX)
+            "NeuralMix didn’t beat-mix · $kind complete" else "Mix complete"
+        else -> if (view.neuralMode && view.style != TransitionStyle.HARMONIC_BEATMIX)
+            "Fallback: $kind in ${seconds / 60}:${"%02d".format(seconds % 60)}"
+        else "$kind in ${seconds / 60}:${"%02d".format(seconds % 60)}"
     }
     AutoMixDeckView(
         view = view,

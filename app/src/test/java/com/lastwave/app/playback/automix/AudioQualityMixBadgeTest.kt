@@ -1,5 +1,6 @@
 package com.lastwave.app.playback.automix
 
+import com.lastwave.app.playback.automix.api.MixEngine
 import com.lastwave.app.playback.automix.api.BlendPhase
 import com.lastwave.app.playback.automix.api.DeckBlendTelemetry
 import com.lastwave.app.playback.automix.api.NormalizedFloat
@@ -10,6 +11,19 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AudioQualityMixBadgeTest {
+    @Test fun neuralLabelsNeverClaimBeatMixForFallback() {
+        val fade = DeckBlendTelemetry(phase = BlendPhase.BLENDING, engine = MixEngine.NEURALMIX)
+        assertEquals("NeuralMix", fade.mixName)
+        assertEquals("NeuralMix · Fade", fade.mixStatusLabel)
+        assertEquals("NeuralMix · Not beat-mixed", fade.copy(phase = BlendPhase.MIX_COMPLETED).mixStatusLabel)
+        assertEquals("NeuralMix", fade.copy(activeTransitionStyle = TransitionStyle.HARMONIC_BEATMIX).mixStatusLabel)
+        assertEquals("AutoMix", fade.copy(engine = MixEngine.AUTOMIX).mixName)
+        assertEquals("NeuralMix didn’t mix", fade.copy(noMixReason = "album sequence").mixStatusLabel)
+        val missed = DeckBlendTelemetry(engine = MixEngine.NEURALMIX, noMixCompleted = true, noMixReason = "not ready")
+        assertEquals("NeuralMix didn’t mix", missed.mixStatusLabel)
+        assertFalse(missed.isBlendingActive)
+    }
+
 
     @Test
     fun telemetry_isBlendingActiveOnlyWhileBlending() {

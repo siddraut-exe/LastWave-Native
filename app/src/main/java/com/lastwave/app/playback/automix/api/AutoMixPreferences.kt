@@ -34,6 +34,8 @@ data class AutoMixSettings(
     val neuralBass: Boolean = true,
     val neuralVocals: Boolean = true,
     val neuralQuality: ThermalProfile = ThermalProfile.BALANCED,
+    val neuralAllQueues: Boolean = true,
+    val neuralPriorityTracks: Int = 3,
 )
 
 internal val Context.autoMixDataStore by preferencesDataStore(name = "automix_prefs")
@@ -43,6 +45,8 @@ class AutoMixPreferences @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
     private object Keys {
+        val NEURAL_ALL_QUEUES = booleanPreferencesKey("neuralmix_all_queues")
+        val NEURAL_PRIORITY_TRACKS = intPreferencesKey("neuralmix_priority_tracks")
         val NEURAL_BASS = booleanPreferencesKey("neuralmix_bass")
         val NEURAL_VOCALS = booleanPreferencesKey("neuralmix_vocals")
         val NEURAL_QUALITY = stringPreferencesKey("neuralmix_quality")
@@ -73,6 +77,8 @@ class AutoMixPreferences @Inject constructor(
             intelligentDjEnabled = prefs[Keys.DJ_ENABLED] ?: false,
             neuralBass = prefs[Keys.NEURAL_BASS] ?: true,
             neuralVocals = prefs[Keys.NEURAL_VOCALS] ?: true,
+            neuralAllQueues = prefs[Keys.NEURAL_ALL_QUEUES] ?: true,
+            neuralPriorityTracks = (prefs[Keys.NEURAL_PRIORITY_TRACKS] ?: 3).takeIf { it in listOf(3, 5, 8) } ?: 3,
             neuralQuality = runCatching { ThermalProfile.valueOf(prefs[Keys.NEURAL_QUALITY] ?: "BALANCED") }.getOrDefault(ThermalProfile.BALANCED),
             durationMode = mode,
             targetDurationSeconds = (prefs[Keys.TARGET_SECONDS] ?: 12).coerceIn(12, 30),
@@ -99,6 +105,8 @@ class AutoMixPreferences @Inject constructor(
         }
     }
 
+    suspend fun setNeuralAllQueues(enabled: Boolean) { context.autoMixDataStore.edit { it[Keys.NEURAL_ALL_QUEUES] = enabled } }
+    suspend fun setNeuralPriorityTracks(value: Int) { context.autoMixDataStore.edit { it[Keys.NEURAL_PRIORITY_TRACKS] = value.takeIf { count -> count in listOf(3, 5, 8) } ?: 3 } }
     suspend fun setNeuralBass(enabled: Boolean) { context.autoMixDataStore.edit { it[Keys.NEURAL_BASS] = enabled } }
     suspend fun setNeuralVocals(enabled: Boolean) { context.autoMixDataStore.edit { it[Keys.NEURAL_VOCALS] = enabled } }
     suspend fun setNeuralQuality(value: ThermalProfile) { context.autoMixDataStore.edit { it[Keys.NEURAL_QUALITY] = value.name } }

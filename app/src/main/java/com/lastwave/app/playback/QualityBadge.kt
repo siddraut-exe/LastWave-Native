@@ -15,7 +15,11 @@ import kotlin.math.roundToInt
  * Spatial mixes use a short `ATMOS` or `SPATIAL` badge.
  */
 fun qualityBadgeLabel(state: MusicPlayerState): String {
-    if (state.deckBlendTelemetry.isBlendingActive || state.deckBlendTelemetry.phase == com.lastwave.app.playback.automix.api.BlendPhase.MIX_COMPLETED) return "AUTOMIXING"
+    if (state.deckBlendTelemetry.isNeuralMix && state.deckBlendTelemetry.noMixCompleted) return state.deckBlendTelemetry.mixStatusLabel
+    if (state.deckBlendTelemetry.isBlendingActive || state.deckBlendTelemetry.phase == com.lastwave.app.playback.automix.api.BlendPhase.MIX_COMPLETED) {
+        val mix = state.deckBlendTelemetry
+        return if (mix.isNeuralMix) mix.mixStatusLabel else "AUTOMIXING"
+    }
     if (state.isCrossfading) return "CROSSFADING"
     val spatial = spatialIndicatorLabel(state.audioCodec)
     if (spatial != null) return spatial

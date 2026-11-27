@@ -1228,6 +1228,7 @@ internal fun FullPlayer(
                                     LiquidGlassSurface(
                                         onClick = hapticClick {
                                             isQueueLockedState = !isQueueLockedState
+                                            player.setNeuralQueueLocked(isQueueLockedState)
                                         },
                                         shape = CircleShape,
                                         color = if (isQueueLockedState) MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)

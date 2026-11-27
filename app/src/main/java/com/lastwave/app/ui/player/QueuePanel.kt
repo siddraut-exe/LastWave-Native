@@ -59,6 +59,8 @@ import kotlin.math.cos
 import kotlin.math.sin
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.layout.boundsInRoot
@@ -336,6 +338,21 @@ internal fun QueuePanel(
     modifier: Modifier = Modifier,
 ) {
     val isQueueLocked = isQueueLockedState
+    val neuralQueue by player.neuralQueueState.collectAsStateWithLifecycle()
+    val neuralMode = state.deckBlendTelemetry.isNeuralMix && state.currentIndex in state.queue.indices
+    val neuralStateMatches = neuralMode && state.current?.let(player::neuralQueueKey) == neuralQueue.currentKey
+    val neuralKeys = remember(state.queue) { state.queue.map(player::neuralQueueKey) }
+    val duplicateNeuralKeys = remember(neuralKeys) { neuralKeys.groupingBy { it }.eachCount().filterValues { it > 1 }.keys }
+    val neuralPriorityCount = if (!neuralMode) 0 else if (neuralStateMatches && neuralQueue.committed) {
+        neuralQueue.priorityKeys.zip(neuralKeys.drop(state.currentIndex + 1)).takeWhile { (a, b) -> a == b }.size
+    } else minOf(if (neuralStateMatches) neuralQueue.previewDepth else 3, state.queue.size - state.currentIndex - 1)
+    val neuralEnd = state.currentIndex + neuralPriorityCount
+    val neuralStatus = when {
+        state.deckBlendTelemetry.noMixCompleted -> "NeuralMix didn’t mix"
+        state.deckBlendTelemetry.isBlendingActive -> state.deckBlendTelemetry.mixStatusLabel
+        !neuralStateMatches -> "Waiting for analysis"
+        else -> neuralQueue.stage
+    }
     val listState = rememberLazyListState()
     val haptics = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
@@ -563,11 +580,29 @@ internal fun QueuePanel(
             }
             Spacer(Modifier.height(6.dp))
         }
+        val neuralOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+        val neuralBackground = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.24f)
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .clip(TopCurvedSectionClipShape(horizontalInset = 0.dp, cornerRadius = 28.dp)),
+                .clip(TopCurvedSectionClipShape(horizontalInset = 0.dp, cornerRadius = 28.dp))
+                .drawBehind {
+                    if (neuralMode) {
+                        val group = listState.layoutInfo.visibleItemsInfo.filter { it.index in state.currentIndex..neuralEnd }
+                        if (group.isNotEmpty()) {
+                            val radius = 20.dp.toPx()
+                            val top = if (group.first().index == state.currentIndex) group.first().offset.toFloat() else -radius
+                            val bottom = if (group.last().index == neuralEnd) (group.last().offset + group.last().size).toFloat() else size.height + radius
+                            if (bottom > top && size.width > 2f) {
+                                val position = Offset(1f, top + 1f)
+                                val bounds = Size(size.width - 2f, (bottom - top - 2f).coerceAtLeast(1f))
+                                drawRoundRect(neuralBackground, position, bounds, CornerRadius(radius))
+                                drawRoundRect(neuralOutline, position, bounds, CornerRadius(radius), style = Stroke(1.dp.toPx()))
+                            }
+                        }
+                    }
+                },
             contentPadding = PaddingValues(bottom = bottomPadding),
             verticalArrangement = Arrangement.spacedBy(GroupGap),
         ) {
@@ -600,7 +635,9 @@ internal fun QueuePanel(
                     }
                 }
                 val position = groupPositionFor(index, state.queue.size)
-                val itemShape = groupShape(position)
+                val inNeuralGroup = neuralMode && index in state.currentIndex..neuralEnd
+                val firstNeural = inNeuralGroup && isCurrent
+                val itemShape = if (inNeuralGroup) RoundedCornerShape(12.dp) else groupShape(position)
 
                 val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
                     confirmValueChange = { dismissValue ->
@@ -642,6 +679,37 @@ internal fun QueuePanel(
                             alpha = if (isDragging) 0.96f else 1f
                         },
                 ) {
+                    Column(
+                        Modifier.fillMaxWidth().then(
+                            if (inNeuralGroup) Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                            else Modifier
+                        )
+                    ) {
+                    if (firstNeural) {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.GraphicEq, contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Neural's Queue", style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f))
+                                if (neuralStateMatches && neuralQueue.total > 0) Text(
+                                    "${neuralQueue.examined}/${neuralQueue.total}",
+                                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                            Text(neuralStatus, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (neuralStateMatches && neuralQueue.committed && neuralPriorityCount > 0) Text(
+                                "$neuralPriorityCount planned upcoming match${if (neuralPriorityCount == 1) "" else "es"}",
+                                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                            ) else if (neuralPriorityCount > 0) Text(
+                                "Candidate preview · order not yet verified",
+                                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                     androidx.compose.material3.SwipeToDismissBox(
                         state = dismissState,
                         enableDismissFromStartToEnd = false,
@@ -686,7 +754,8 @@ internal fun QueuePanel(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(
-                                        "${index + 1}",
+                                        "${if (neuralMode && neuralStateMatches && neuralKeys[index] !in duplicateNeuralKeys)
+                                            neuralQueue.originalPositions[neuralKeys[index]] ?: (index + 1) else index + 1}",
                                         style = MaterialTheme.typography.labelSmall,
                                         fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
                                         color = if (isCurrent) MaterialTheme.colorScheme.primary
@@ -710,6 +779,13 @@ internal fun QueuePanel(
                                             else MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
+                                        )
+                                        if (inNeuralGroup && !isCurrent) Text(
+                                            if (neuralStateMatches && neuralQueue.committed) {
+                                                if (index == state.currentIndex + 1) "Next match" else "Planned ${index - state.currentIndex}"
+                                            } else "Candidate",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
                                         )
                                     }
                                     IconButton(
@@ -793,6 +869,7 @@ internal fun QueuePanel(
                             }
                         }
                     )
+                    }
                 }
             }
             item { Spacer(Modifier.height(12.dp)) }

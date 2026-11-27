@@ -387,6 +387,8 @@ android {
         }
         debug {
             isDebuggable = true
+            applicationIdSuffix = ".neuralmix"
+            versionNameSuffix = "-NeuralMix"
         }
     }
 

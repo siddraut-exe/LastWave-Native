@@ -53,6 +53,15 @@ jobs:
       - name: Prepare Gradle
         run: chmod +x gradlew
 
+      - name: Restore persistent debug signing key
+        env:
+          DEBUG_KEYSTORE: ${{ secrets.NEURALMIX_DEBUG_KEYSTORE }}
+        run: |
+          test -n "$DEBUG_KEYSTORE"
+          mkdir -p "$HOME/.android"
+          printf '%s' "$DEBUG_KEYSTORE" | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+
       - name: Build Debug APK
         run: |
           ./gradlew :app:assembleDebug \

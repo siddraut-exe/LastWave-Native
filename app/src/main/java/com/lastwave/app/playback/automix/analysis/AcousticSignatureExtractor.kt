@@ -1,5 +1,7 @@
 package com.lastwave.app.playback.automix.analysis
 
+import com.lastwave.app.playback.automix.neuralmix.BeatSynchronousAnalyzer
+import com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint
 import android.content.Context
 import android.os.Process
 import android.util.Log
@@ -67,15 +69,17 @@ class AcousticSignatureExtractor @Inject constructor(
         val started = System.currentTimeMillis()
         val signature = PcmWindowDecoder(input).use { decoder ->
             val durationMs = decoder.durationMs.takeIf { it > 0L } ?: track.durationMs ?: return null
-            val intro = decoder.decode(0L, WINDOW_MS)?.let { TrackAnalyzer.analyze(it.pcm, it.sampleRate, it.startMs) }
+            val intro = decoder.decode(0L, WINDOW_MS)?.let(::analyzeWindow)
             val outroStart = (durationMs - WINDOW_MS).coerceAtLeast(0L)
-            val outro = decoder.decode(outroStart, WINDOW_MS)?.let { TrackAnalyzer.analyze(it.pcm, it.sampleRate, it.startMs) }
+            val outro = decoder.decode(outroStart, WINDOW_MS)?.let(::analyzeWindow)
             if (intro == null && outro == null) return null
             AcousticSignature(
                 key = key,
                 durationMs = durationMs,
-                intro = intro,
-                outro = outro,
+                intro = intro?.first,
+                outro = outro?.first,
+                introRhythm = intro?.second,
+                outroRhythm = outro?.second,
                 vocals = vocalSpans(track, durationMs),
             )
         }
@@ -86,6 +90,15 @@ class AcousticSignatureExtractor @Inject constructor(
                 "vocals=${signature.vocals?.size ?: "unknown"}",
         )
         return signature
+    }
+
+    private fun analyzeWindow(window: PcmWindowDecoder.Window): Pair<WindowAnalysis, RhythmFingerprint?> {
+        val analysis = TrackAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs)
+        val grid = analysis.grid
+        val fingerprint = if (grid != null && grid.confidence >= 0.6f && grid.barConfidence >= 0.5f) {
+            BeatSynchronousAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs, grid.downbeatMs, grid.bpm.toDouble())
+        } else null
+        return analysis to fingerprint
     }
 
     /** Synced lyric lines are the only vocal evidence trusted; audio-only guesses were noise. */

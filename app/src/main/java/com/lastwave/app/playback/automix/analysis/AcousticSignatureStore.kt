@@ -1,5 +1,6 @@
 package com.lastwave.app.playback.automix.analysis
 
+import com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint
 import android.util.Log
 import android.util.LruCache
 import kotlinx.serialization.Serializable
@@ -9,7 +10,7 @@ import java.io.File
 import java.security.MessageDigest
 
 /** Bump when analysis output changes meaning: older files are then ignored, never misread. */
-const val ANALYSIS_VERSION = 2
+const val ANALYSIS_VERSION = 3
 
 @Serializable
 data class VocalSpan(val startMs: Long, val endMs: Long)
@@ -28,6 +29,8 @@ data class AcousticSignature(
     val outro: WindowAnalysis?,
     /** From synced lyrics only; null when the song has none. */
     val vocals: List<VocalSpan>?,
+    val introRhythm: RhythmFingerprint? = null,
+    val outroRhythm: RhythmFingerprint? = null,
 ) {
     /** Null when unknown. */
     fun hasVocalsBetween(fromMs: Long, toMs: Long): Boolean? =

@@ -75,6 +75,29 @@ class AcousticSignatureStore(private val directory: File) {
         }.onFailure { Log.w(TAG, "Could not persist analysis for ${signature.key}", it) }
     }
 
+    /** A stable recording ID is only a shortlist hint; never a substitute for an exact rendition key. */
+    @Synchronized
+    fun recordingHint(identity: String): AcousticSignature? {
+        val file = recordingFile(identity)
+        val key = runCatching { if (file.isFile && file.length() in 1L..4096L) file.readText() else null }.getOrNull() ?: return null
+        return get(key)?.takeIf { it.intro != null }
+    }
+
+    @Synchronized
+    fun rememberRecording(identity: String, signature: AcousticSignature) {
+        if (signature.intro == null || signature.version != ANALYSIS_VERSION || signature.key.length > 4096) return
+        runCatching {
+            val file = recordingFile(identity)
+            if (file.isFile && file.length() <= 4096 && file.readText() == signature.key) return@runCatching
+            file.parentFile?.mkdirs()
+            val temp = File(file.parentFile, file.name + ".tmp")
+            temp.writeText(signature.key)
+            check(temp.renameTo(file))
+        }.onFailure { Log.w(TAG, "Could not persist recording hint", it) }
+    }
+
+    private fun recordingFile(identity: String): File = File(File(directory, "recordings"), fileFor(identity).name)
+
     private fun fileFor(key: String): File {
         val digest = MessageDigest.getInstance("SHA-1").digest(key.toByteArray())
         return File(directory, digest.joinToString("") { "%02x".format(it) } + ".json")

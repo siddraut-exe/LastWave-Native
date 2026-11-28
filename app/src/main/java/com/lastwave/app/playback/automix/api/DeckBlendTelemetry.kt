@@ -37,6 +37,10 @@ enum class MixShape {
     BASS_SWAP,
     /** The outgoing song keeps its level and ends on its own (cold endings). */
     HOLD_OUTGOING,
+    /** Real filter automation on processed decks. */
+    FILTER_FADE,
+    /** Real bounded PCM delay on the outgoing processed deck. */
+    ECHO_OUT,
 }
 
 /** One deck as the mix view draws it. */
@@ -77,6 +81,12 @@ data class MixView(
     val neuralComponents: Map<String, Double> = emptyMap(),
     val neuralReason: String? = null,
 ) {
+    val techniqueName: String get() = when (shape) {
+        MixShape.BASS_SWAP -> if (style == TransitionStyle.HARMONIC_BEATMIX) "Bass Swap" else "Bass fade"
+        MixShape.FILTER_FADE -> "Filter Fade"
+        MixShape.ECHO_OUT -> "Echo Out"
+        else -> if (style == TransitionStyle.HARMONIC_BEATMIX) "Phrase Fade" else "Smooth fade"
+    }
     fun incomingToOutgoing(incomingMs: Double): Double = cueOutMs + (incomingMs - cueInMs) / tempoRatio
 }
 

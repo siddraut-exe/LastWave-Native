@@ -21,6 +21,14 @@ object MixCurve {
         val t = p.coerceIn(0f, 1f)
         val (outgoing, incoming) = when (shape) {
             MixShape.EQUAL_POWER -> cos(t * PI / 2).toFloat() to sin(t * PI / 2).toFloat()
+            MixShape.FILTER_FADE -> {
+                val s = t * t * (3f - 2f * t)
+                (1f - s) to s
+            }
+            MixShape.ECHO_OUT -> {
+                val x = ((t - 0.15f) / 0.85f).coerceIn(0f, 1f)
+                cos(x * PI / 2).toFloat() to sin(x * PI / 2).toFloat()
+            }
             MixShape.HOLD_OUTGOING -> (1f - t * t * t * t) to sin(t * PI / 2).toFloat()
             MixShape.BASS_SWAP -> if (t < 0.5f) {
                 1f to sin(t * PI).toFloat()
@@ -36,7 +44,8 @@ object MixCurve {
 
     /** Progress at which the incoming deck becomes the one the UI shows. */
     fun handOverPoint(shape: MixShape): Float = when (shape) {
-        MixShape.EQUAL_POWER, MixShape.BASS_SWAP -> 0.5f
+        MixShape.EQUAL_POWER, MixShape.BASS_SWAP, MixShape.FILTER_FADE -> 0.5f
+        MixShape.ECHO_OUT -> 0.575f
         MixShape.HOLD_OUTGOING -> 0.85f
     }
 }

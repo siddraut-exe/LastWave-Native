@@ -10,20 +10,32 @@ data class NeuralQueueState(
     val priorityKeys: List<String> = emptyList(),
     val committed: Boolean = false,
     val previewDepth: Int = 3,
+    val scores: Map<String, CompatibilityScore> = emptyMap(),
+    val bassTies: Map<String, Double> = emptyMap(),
 )
 
-/** First edge uses the live outgoing track. Subsequent edges require pairwise evidence. */
+/** Rank all measured candidates. Unknowns stay in their original relative order. */
 object NeuralQueueOptimizer {
-    fun chain(firstScores: List<Double?>, depth: Int = 3, edge: (Int, Int) -> Double?): List<Int> {
-        val first = NeuralDjSchedule.winner(firstScores) ?: return emptyList()
-        if (depth <= 0) return emptyList()
-        val result = mutableListOf(first)
-        while (result.size < depth) {
-            val previous = result.last()
-            val next = firstScores.indices.asSequence().filter { it !in result }
-                .mapNotNull { index -> edge(previous, index)?.takeIf { it.isFinite() && it >= 40.0 }?.let { index to it } }
-                .maxByOrNull { it.second }?.first ?: break
-            result += next
+    private const val TIE_EPSILON = 0.000001
+
+    fun prioritize(scores: List<Double?>, bass: (Int) -> Double? = { null }): List<Int> {
+        val sorted = scores.indices.filter { scores[it]?.isFinite() == true }
+            .sortedWith(compareByDescending<Int> { scores[it]!! }.thenBy { it })
+        if (sorted.isEmpty()) return emptyList()
+        val result = mutableListOf<Int>()
+        var i = 0
+        while (i < sorted.size) {
+            val first = scores[sorted[i]]!!
+            var end = i + 1
+            while (end < sorted.size && first - scores[sorted[end]]!! <= TIE_EPSILON) end++
+            val group = sorted.subList(i, end)
+            // Only a real tie calls the bass callback. If any member lacks
+            // evidence, retain stable order instead of penalizing the unknown.
+            val ties = if (group.size > 1) group.associateWith(bass) else emptyMap()
+            if (ties.isNotEmpty() && ties.values.all { it?.isFinite() == true }) {
+                result.addAll(group.sortedWith(compareByDescending<Int> { ties[it]!! }.thenBy { it }))
+            } else result.addAll(group.sorted())
+            i = end
         }
         return result
     }

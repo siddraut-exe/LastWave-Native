@@ -348,7 +348,7 @@ private fun AutoMixPopupContent(
             (if (completedAtMs > 0L) (nowMs - completedAtMs).coerceIn(0L, POST_ROLL_MS) else 0L).toDouble()
         else -> progress.positionMs.toDouble()
     }
-    val kind = when (view.style) {
+    val kind = if (view.neuralMode) view.techniqueName else when (view.style) {
         TransitionStyle.HARMONIC_BEATMIX -> "Beat blend"
         TransitionStyle.SPECTRAL_SWEEP -> "Bass exchange"
         TransitionStyle.PERCEPTUAL_FADE -> "Smooth fade"

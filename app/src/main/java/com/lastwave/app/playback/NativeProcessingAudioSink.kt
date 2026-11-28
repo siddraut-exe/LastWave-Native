@@ -1081,6 +1081,7 @@ class NativeProcessingAudioSink(
         // Before the EQ: a deck coming in with its bass cut still shows its kicks.
         autoMixTaps.kicks.process(output, outputChannelCount, processor.nativeOutputSampleRate, mediaUs)
         autoMixTaps.eq.process(output, outputChannelCount, processor.nativeOutputSampleRate, mediaUs)
+        autoMixTaps.echo.process(output, outputChannelCount, processor.nativeOutputSampleRate, mediaUs)
         autoMixTaps.level.process(output, outputChannelCount, processor.nativeOutputSampleRate)
     }
 
@@ -1880,6 +1881,7 @@ class NativeProcessingAudioSink(
         hapticsBuffer = null
         runCatching { hapticsAnalyzer?.flush() }
         runCatching { rhythmAnalyzer.flush() }
+        autoMixTaps.echo.clear()
         autoMixTaps.eq.resetFilter()
         autoMixTaps.kicks.reset()
         clearPending()

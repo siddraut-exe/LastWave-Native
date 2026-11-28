@@ -2771,9 +2771,9 @@ fun SettingsScreen(
                 if (showNeuralQuality) {
                     com.lastwave.app.playback.automix.api.ThermalProfile.entries.forEach { profile ->
                         val (name, description) = when (profile) {
-                            com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> "Efficient" to "Analyze up to 3 upcoming tracks, one at a time."
-                            com.lastwave.app.playback.automix.api.ThermalProfile.BALANCED -> "Balanced" to "Analyze up to 5 upcoming tracks, one at a time."
-                            com.lastwave.app.playback.automix.api.ThermalProfile.PERFORMANCE -> "Maximum" to "Analyze up to 8 upcoming tracks within the available time."
+                            com.lastwave.app.playback.automix.api.ThermalProfile.ECO -> "Efficient" to "Compare up to 50 queued tracks using available cached analysis; freshly analyze up to 3."
+                            com.lastwave.app.playback.automix.api.ThermalProfile.BALANCED -> "Balanced" to "Compare up to 100 queued tracks using available cached analysis; freshly analyze up to 5."
+                            com.lastwave.app.playback.automix.api.ThermalProfile.PERFORMANCE -> "Maximum" to "Compare up to 200 queued tracks using available cached analysis; freshly analyze up to 8."
                         }
                         Row(
                             modifier = Modifier.fillMaxWidth().clickable { viewModel.setNeuralQuality(profile) }.padding(vertical = 8.dp),
@@ -2788,10 +2788,10 @@ fun SettingsScreen(
                     }
                     TextButton(onClick = { showNeuralQuality = false }) { Text("Back to NeuralMix") }
                 } else {
-                    NeuralMixSheetToggle("Intelligent DJ", "Prepare candidates at 25% playback and optimize the upcoming order after the midpoint. Applies to the active queue, including playlists; saved playlist order is unchanged. Turn off normal shuffle for NeuralMix ordering.", hfSettings.intelligentDjEnabled, viewModel::setIntelligentDjEnabled)
+                    NeuralMixSheetToggle("Intelligent DJ", "Prepare candidates early, then rank by tempo (40), harmony (40), phrasing (20). Bass breaks genuine ties only. No track is removed for a low score. Applies to the active queue, including playlists; saved playlist order is unchanged. Turn off normal shuffle for NeuralMix ordering.", hfSettings.intelligentDjEnabled, viewModel::setIntelligentDjEnabled)
                     NeuralMixSheetToggle("Optimize all playback queues", "Include search, normal queues and saved playlists. Off limits optimization to automatic radio additions.", hfSettings.neuralAllQueues, viewModel::setNeuralAllQueues)
                     Text("Priority queue size", style = MaterialTheme.typography.titleMedium)
-                    Text("Maximum verified upcoming matches; the current song is shown separately. Analysis quality and available time may reduce the number.", style = MaterialTheme.typography.bodySmall)
+                    Text("Number of highest priority upcoming tracks highlighted in the queue. The remaining tracks stay available for subsequent cycles.", style = MaterialTheme.typography.bodySmall)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         listOf(3, 5, 8).forEach { count ->
                             Row(Modifier.clickable { viewModel.setNeuralPriorityTracks(count) }, verticalAlignment = Alignment.CenterVertically) {

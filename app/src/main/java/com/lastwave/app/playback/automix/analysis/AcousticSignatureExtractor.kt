@@ -1,6 +1,5 @@
 package com.lastwave.app.playback.automix.analysis
 
-import com.lastwave.app.playback.automix.neuralmix.BeatSynchronousAnalyzer
 import com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint
 import android.content.Context
 import android.os.Process
@@ -58,6 +57,16 @@ class AcousticSignatureExtractor @Inject constructor(
 
     fun signature(key: String): AcousticSignature? = store.get(key)
 
+    private fun recordingIdentity(track: PlayableTrack): String? =
+        track.videoId?.takeIf { it.isNotBlank() }?.let { "video:$it" }
+            ?: track.internalTrackId?.takeIf { it.isNotBlank() }?.let { "library:$it" }
+
+    fun recordingHint(track: PlayableTrack): AcousticSignature? = recordingIdentity(track)?.let(store::recordingHint)
+    fun rememberRecording(track: PlayableTrack, signature: AcousticSignature) {
+        recordingIdentity(track)?.let { store.rememberRecording(it, signature) }
+    }
+
+
     /** A candidate needs only its intro; keep that cache separate from a full signature. */
     fun incomingSignature(key: String): AcousticSignature? =
         signature(key)?.takeIf { it.intro != null } ?: store.get(introKey(key))
@@ -102,12 +111,17 @@ class AcousticSignatureExtractor @Inject constructor(
                     val complete = signature.copy(vocals = vocals)
                     if (!introOnly && complete.outro == null) {
                         // Preserve a useful intro, but allow a later outro retry.
-                        if (complete.intro != null) store.put(complete.copy(key = introKey(key)))
+                        if (complete.intro != null) {
+                            val partial = complete.copy(key = introKey(key))
+                            store.put(partial)
+                            rememberRecording(track, partial)
+                        }
                         failed[storageKey] = SystemClock.elapsedRealtime()
                     } else if (introOnly && complete.intro == null) {
                         failed[storageKey] = SystemClock.elapsedRealtime()
                     } else {
                         store.put(complete)
+                        rememberRecording(track, complete)
                         failed.remove(storageKey)
                     }
                 } else {
@@ -130,7 +144,7 @@ class AcousticSignatureExtractor @Inject constructor(
             val durationMs = decoder.durationMs.takeIf { it > 0L } ?: track.durationMs ?: return null
             if (durationMs <= 0L) return null
             suspend fun window(startMs: Long): Pair<WindowAnalysis, RhythmFingerprint?>? = try {
-                withTimeoutOrNull(WINDOW_TIMEOUT_MS) { decoder.decode(startMs, WINDOW_MS)?.let(::analyzeWindow) }
+                withTimeoutOrNull(WINDOW_TIMEOUT_MS) { decoder.decode(startMs, WINDOW_MS)?.let { analyzeWindow(it) } }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -160,14 +174,8 @@ class AcousticSignatureExtractor @Inject constructor(
         return signature
     }
 
-    private fun analyzeWindow(window: PcmWindowDecoder.Window): Pair<WindowAnalysis, RhythmFingerprint?> {
-        val analysis = TrackAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs)
-        val grid = analysis.grid
-        val fingerprint = if (grid != null && grid.confidence >= 0.6f) {
-            BeatSynchronousAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs, grid.downbeatMs, grid.bpm.toDouble())
-        } else null
-        return analysis to fingerprint
-    }
+    private fun analyzeWindow(window: PcmWindowDecoder.Window): Pair<WindowAnalysis, RhythmFingerprint?> =
+        TrackAnalyzer.analyze(window.pcm, window.sampleRate, window.startMs) to null
 
     /** Synced lyric lines are the only vocal evidence trusted; audio-only guesses were noise. */
     private suspend fun vocalSpans(track: PlayableTrack, durationMs: Long): List<VocalSpan>? {

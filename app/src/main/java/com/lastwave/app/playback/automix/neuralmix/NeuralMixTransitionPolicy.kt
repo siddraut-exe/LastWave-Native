@@ -1,11 +1,14 @@
 package com.lastwave.app.playback.automix.neuralmix
 
-/** Conservative experimental limits; the original planner still validates every cue. */
+/** These are execution limits only. Queue ranking never consults them. */
 object NeuralMixTransitionPolicy {
     fun maxBars(score: CompatibilityScore?): Int {
-        if (score == null || !score.score.isFinite() || !score.coverage.isFinite()) return 0
-        val rhythm = score.components["rhythm"] ?: return 0
-        if (!rhythm.isFinite() || score.coverage < 0.5 || score.score < 55 || rhythm < 0.5) return 0
-        return if (score.score >= 80) 16 else 4
+        val tempo = score?.components?.get("tempo") ?: return 0
+        val phrase = score.components["phrasing"] ?: return 0
+        if (!tempo.isFinite() || !phrase.isFinite() || tempo < 0.5 || phrase < 0.25) return 0
+        val harmony = score.components["harmonic"]
+        // Long blends need positive evidence of harmony; don't equate unknown with safe.
+        if (harmony != null && harmony >= 0.9 && phrase >= 0.9) return 8
+        return if (phrase >= 0.5) 2 else 1
     }
 }

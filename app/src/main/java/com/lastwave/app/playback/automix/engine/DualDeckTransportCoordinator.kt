@@ -189,26 +189,27 @@ class DualDeckTransportCoordinator @Inject constructor(
         if (introOnly) analyzer.isIntroSettled(key) else analyzer.isSettled(key)
     fun djAnalysisStatus(key: String, introOnly: Boolean = false): String = analyzer.status(key, introOnly)
 
-    /** Prefer beat-lock, but rank useful fade candidates independently of strict beat-lock constraints. */
-    fun djCandidateScore(outgoing: MediaItem, incoming: MediaItem, durationMs: Long): Double? {
-        if (!intelligentDjActive()) return null
-        val out = analyzer.signature(analysisKey(outgoing)) ?: return null
+    /** Cache reads only; called off main, independently of the playback planner. */
+    fun djCandidateScore(outgoing: MediaItem, incoming: MediaItem): com.lastwave.app.playback.automix.neuralmix.CompatibilityScore? {
+        val outKey = analysisKey(outgoing)
+        val out = analyzer.signature(outKey) ?: analyzer.incomingSignature(outKey) ?: return null
         val inc = analyzer.incomingSignature(analysisKey(incoming)) ?: return null
-        val decision = TransitionPlanner.plan(PlanInput(
-            outgoing = outgoing.toPlayableTrack(), incoming = incoming.toPlayableTrack(),
-            outgoingDurationMs = durationMs, incomingDurationMs = inc.durationMs,
-            outgoingSignature = out, incomingSignature = inc, settings = settings,
-            userSpeed = 1f, userPitch = 1f,
-        )) as? MixPlan ?: return null
-        val score = decision.neuralScore
-        Log.i(TAG, "NeuralMix DJ '${incoming.mediaMetadata.title}': ${decision.neuralReason}, score=${score?.score}, coverage=${score?.coverage}")
-        return com.lastwave.app.playback.automix.neuralmix.NeuralDjSchedule.rank(score, decision.beatLocked)
+        analyzer.rememberRecording(incoming.toPlayableTrack(), inc)
+        return com.lastwave.app.playback.automix.neuralmix.SignatureCompatibility.compare(out, inc)
     }
 
-    /** A chain edge is evaluated against the actual preceding track's outro. */
-    fun djSequenceScore(outgoing: MediaItem, incoming: MediaItem): Double? {
-        val signature = analyzer.signature(analysisKey(outgoing)) ?: return null
-        return djCandidateScore(outgoing, incoming, signature.durationMs)
+    /** Approximate discovery only. The actual stream is resolved and rescored before moving it. */
+    fun djRecordingHint(outgoing: MediaItem, track: PlayableTrack): Double? {
+        val outKey = analysisKey(outgoing)
+        val out = analyzer.signature(outKey) ?: analyzer.incomingSignature(outKey) ?: return null
+        val inc = analyzer.recordingHint(track) ?: return null
+        return com.lastwave.app.playback.automix.neuralmix.SignatureCompatibility.compare(out, inc)?.score
+    }
+
+    fun djBassTie(outgoing: MediaItem, incoming: MediaItem): Double? {
+        val out = analyzer.signature(analysisKey(outgoing)) ?: return null
+        val inc = analyzer.incomingSignature(analysisKey(incoming)) ?: return null
+        return com.lastwave.app.playback.automix.neuralmix.SignatureCompatibility.bassTie(out, inc)
     }
 
     fun setBaseVolume(volume: Float) {
@@ -366,10 +367,12 @@ class DualDeckTransportCoordinator @Inject constructor(
         val userParameters = outgoing.playbackParameters
         val outSink = deckSink?.invoke(outgoing)
         val inSink = deckSink?.invoke(incoming)
-        val plan = if (requestedPlan.neuralMode && requestedPlan.bassSwapAtMs != null && (outSink == null || inSink == null)) {
+        val needsEq = requestedPlan.bassSwapAtMs != null || requestedPlan.shape == MixShape.FILTER_FADE
+        val needsEcho = requestedPlan.shape == MixShape.ECHO_OUT
+        val plan = if (requestedPlan.neuralMode && ((needsEq && (outSink == null || inSink == null)) || (needsEcho && outSink == null))) {
             requestedPlan.copy(shape = MixShape.EQUAL_POWER, bassSwapAtMs = null, bassSwapRampMs = 0L,
                 style = if (requestedPlan.beatLocked) requestedPlan.style else com.lastwave.app.playback.automix.api.TransitionStyle.PERCEPTUAL_FADE,
-                neuralReason = "EQ taps unavailable; equal-power blend")
+                neuralReason = "Effect taps unavailable; equal-power blend")
         } else requestedPlan
         incoming.volume = 0f
         if (abs(incoming.currentPosition - startIn) > CUE_TOLERANCE_MS) incoming.seekTo(startIn)
@@ -389,6 +392,21 @@ class DualDeckTransportCoordinator @Inject constructor(
                     null
                 },
             )
+        }
+        if (plan.shape == MixShape.FILTER_FADE) {
+            val ramp = plan.overlapMs * 1000L
+            outSink?.eq?.schedule(
+                bass = EqAutomation(plan.cueOutMs * 1000, 1f, 0f, ramp),
+                treble = EqAutomation(plan.cueOutMs * 1000, 1f, 0f, ramp),
+            )
+            inSink?.eq?.schedule(
+                bass = EqAutomation(plan.cueInMs * 1000, 0f, 1f, ramp),
+                treble = EqAutomation(plan.cueInMs * 1000, 0f, 1f, ramp),
+            )
+        }
+        if (plan.shape == MixShape.ECHO_OUT) {
+            val delayUs = (60_000_000.0 / (plan.bpm ?: 120f)).toLong()
+            outSink?.echo?.schedule(plan.cueOutMs * 1000, plan.overlapMs * 1000, delayUs)
         }
         if (plan.beatLocked) {
             outSink?.kicks?.enabled = true
@@ -411,7 +429,7 @@ class DualDeckTransportCoordinator @Inject constructor(
                 activeTransitionStyle = plan.style,
                 spliceStartPositionMs = plan.cueOutMs,
                 spliceDurationMs = plan.overlapMs,
-                syncedBpm = plan.bpm,
+                syncedBpm = plan.bpm.takeIf { plan.beatLocked },
                 harmonicKeyPair = plan.keyPair,
                 isVocalProtected = plan.vocalSafe,
                 view = mixView(plan),
@@ -549,6 +567,7 @@ class DualDeckTransportCoordinator @Inject constructor(
 
     private fun stopKickTaps(active: Session) {
         for (taps in listOfNotNull(active.outgoingTaps, active.incomingTaps)) {
+            taps.echo.clear()
             taps.kicks.enabled = false
             taps.level.enabled = false
         }
@@ -610,7 +629,7 @@ class DualDeckTransportCoordinator @Inject constructor(
                 phase = BlendPhase.ARMED,
                 engine = if (current.neuralMode) MixEngine.NEURALMIX else MixEngine.AUTOMIX,
                 activeTransitionStyle = current.style,
-                syncedBpm = current.bpm,
+                syncedBpm = current.bpm.takeIf { current.beatLocked },
                 harmonicKeyPair = current.keyPair,
                 spliceStartPositionMs = current.cueOutMs,
                 spliceDurationMs = current.overlapMs,

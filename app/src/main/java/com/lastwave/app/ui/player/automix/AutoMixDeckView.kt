@@ -75,7 +75,7 @@ internal fun AutoMixDeckView(
     BoxWithConstraints(modifier) {
         val fontScale = LocalDensity.current.fontScale
         val compact = maxHeight < 350.dp && maxWidth >= 440.dp
-        val contentHeight = maxOf(maxHeight, (if (compact) 100.dp else 180.dp) * fontScale + 180.dp + if (view.neuralMode) 112.dp * fontScale else 0.dp)
+        val contentHeight = maxOf(maxHeight, (if (compact) 100.dp else 180.dp) * fontScale + 180.dp + if (view.neuralMode) 150.dp * fontScale else 0.dp)
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
             Column(
                 modifier = Modifier.fillMaxWidth().height(contentHeight).padding(horizontal = 20.dp, vertical = 4.dp),
@@ -91,7 +91,7 @@ internal fun AutoMixDeckView(
                     )
                 }
                 if (view.neuralMode) {
-                    Text("NeuralMix Studio", color = StudioContent, style = MaterialTheme.typography.titleSmall)
+                    Text("NeuralMix Studio · ${view.techniqueName}", color = StudioContent, style = MaterialTheme.typography.titleSmall)
                     Text(
                         view.neuralScore?.let { "Compatibility ${it.toInt()}% • Evidence ${((view.neuralCoverage ?: 0.0) * 100).toInt()}%" }
                             ?: "Compatibility unavailable",
@@ -99,9 +99,12 @@ internal fun AutoMixDeckView(
                         style = MaterialTheme.typography.labelMedium,
                     )
                     view.neuralReason?.let { Text(it, color = StudioContent.copy(alpha = 0.8f), style = MaterialTheme.typography.labelSmall) }
-                    Text(view.neuralComponents.entries.joinToString(" • ") { (key, value) -> "${key.replaceFirstChar { it.uppercase() }} ${(value * 100).toInt()}%" },
+                    Text(listOf("tempo" to 40, "harmonic" to 40, "phrasing" to 20).joinToString(" • ") { (key, weight) ->
+                        val points = view.neuralComponents[key]?.let { "%.1f".format(it * weight) } ?: "—"
+                        "${key.replaceFirstChar { it.uppercase() }} $points/$weight"
+                    },
                         color = StudioContent.copy(alpha = 0.8f), style = MaterialTheme.typography.labelSmall)
-                    Text("Tempo ×${"%.3f".format(view.tempoRatio)} • ${view.overlapMs / 1000.0}s",
+                    Text("Tempo ×${"%.3f".format(view.tempoRatio)} • ${view.bars?.let { "${it * 4} beats • " }.orEmpty()}${view.overlapMs / 1000.0}s",
                         color = StudioContent.copy(alpha = 0.8f), style = MaterialTheme.typography.labelMedium)
                 }
                 if (compact) {
@@ -319,6 +322,26 @@ private fun DrawScope.drawMix(view: MixView) {
         val curveColor = if (outgoing) LevelColor else CueColor
         drawPath(path, StudioSurface.copy(alpha = 0.85f), style = Stroke(5.dp.toPx(), cap = StrokeCap.Round))
         drawPath(path, curveColor, style = Stroke(1.5.dp.toPx(), cap = StrokeCap.Round))
+        if (view.neuralMode && (view.shape == com.lastwave.app.playback.automix.api.MixShape.FILTER_FADE ||
+                view.shape == com.lastwave.app.playback.automix.api.MixShape.ECHO_OUT && outgoing || view.bassSwapAtMs != null)) {
+            val effect = Path()
+            for (step in 0..96) {
+                val p = step / 96f
+                val amount = when (view.shape) {
+                    com.lastwave.app.playback.automix.api.MixShape.ECHO_OUT -> com.lastwave.app.playback.automix.engine.NeuralEchoStage.wetAt(p)
+                    com.lastwave.app.playback.automix.api.MixShape.FILTER_FADE -> if (outgoing) p else 1f - p
+                    else -> {
+                        val swap = view.bassSwapAtMs ?: view.cueOutMs
+                        val t = ((view.cueOutMs + p * view.overlapMs - swap) / view.bassSwapRampMs.coerceAtLeast(1L)).coerceIn(0f, 1f)
+                        if (outgoing) t else 1f - t
+                    }
+                }
+                val x = plot.boxLeft + boxWidth * p
+                val y = laneTop + plot.laneHeight - amount * (plot.laneHeight - 4.dp.toPx())
+                if (step == 0) effect.moveTo(x, y) else effect.lineTo(x, y)
+            }
+            drawPath(effect, StudioContent.copy(alpha = 0.7f), style = Stroke(1.dp.toPx()))
+        }
         drawRoundRect(boxColor, Offset(plot.boxLeft, laneTop), Size(boxWidth, plot.laneHeight), corner, Stroke(1.5.dp.toPx()))
     }
 }

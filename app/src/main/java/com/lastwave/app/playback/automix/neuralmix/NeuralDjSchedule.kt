@@ -1,40 +1,18 @@
 package com.lastwave.app.playback.automix.neuralmix
 
-/** All times are media milliseconds. No queue mutation inside the transition preparation window. */
+/** Work against the media clock, not elapsed listening time. */
 object NeuralDjSchedule {
     const val LOCK_REMAINING_MS = 45_000L
-    fun canStart(positionMs: Long, durationMs: Long): Boolean =
-        durationMs > 0 && positionMs >= durationMs / 2 && durationMs - positionMs > LOCK_REMAINING_MS + 5_000L
-
-    // Resolve and analyse ahead of the midpoint; never mutate the queue before it.
+    fun lockRemaining(durationMs: Long): Long = (durationMs / 5).coerceIn(8_000L, LOCK_REMAINING_MS)
+    private fun prepareAt(durationMs: Long): Long = minOf(durationMs / 4, 20_000L)
+    fun canStart(positionMs: Long, durationMs: Long): Boolean = canCommit(positionMs, durationMs)
     fun canPrepare(positionMs: Long, durationMs: Long): Boolean =
-        durationMs > 0 && positionMs >= durationMs / 4 && durationMs - positionMs > LOCK_REMAINING_MS + 5_000L
-
+        durationMs > 0 && positionMs >= prepareAt(durationMs) && durationMs - positionMs > lockRemaining(durationMs) + 1_000L
     fun canContinue(positionMs: Long, durationMs: Long): Boolean =
-        durationMs > 0 && positionMs in 0 until durationMs && durationMs - positionMs > LOCK_REMAINING_MS
-
+        durationMs > 0 && positionMs in 0 until durationMs && durationMs - positionMs > lockRemaining(durationMs)
     fun canCommit(positionMs: Long, durationMs: Long): Boolean =
-        canContinue(positionMs, durationMs) && positionMs >= durationMs / 2
+        canContinue(positionMs, durationMs) && positionMs >= minOf(durationMs / 2, durationMs - lockRemaining(durationMs) - 2_000L).coerceAtLeast(0L)
 
-    /** Beat-lock is preferred, but a well-evidenced smoother fade can also win. */
-    fun rank(score: CompatibilityScore?, beatLocked: Boolean): Double? {
-        if (score == null || !score.score.isFinite() || !score.coverage.isFinite() || score.coverage < 0.5) return null
-        val rhythm = score.components["rhythm"] ?: return null
-        if (!rhythm.isFinite()) return null
-        val weighted = score.score.coerceIn(0.0, 100.0) * score.coverage.coerceIn(0.0, 1.0)
-        return when {
-            beatLocked -> 100.0 + weighted
-            rhythm < 0.35 -> minOf(weighted, 39.0) // weak rhythm must not win a promotion
-            else -> weighted
-        }
-    }
-
-    /** Avoid pointless queue churn: only promote a credible, materially better alternative. */
-    fun winner(scores: List<Double?>): Int? {
-        val best = scores.withIndex().filter { it.value?.isFinite() == true && it.value!! >= 40.0 }
-            .maxByOrNull { it.value!! } ?: return null
-        val first = scores.firstOrNull()?.takeIf { it.isFinite() }
-        if (best.index != 0 && first != null && best.value!! < first + 5.0) return 0
-        return best.index
-    }
+    fun rank(score: CompatibilityScore?): Double? = score?.score?.takeIf { it.isFinite() }
+    fun winner(scores: List<Double?>): Int? = NeuralQueueOptimizer.prioritize(scores).firstOrNull()
 }

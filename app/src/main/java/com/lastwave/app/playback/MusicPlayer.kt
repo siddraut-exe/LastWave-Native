@@ -391,7 +391,9 @@ class MusicPlayer @Inject constructor(
     internal fun neuralQueueKey(track: PlayableTrack): String = neuralSongKey(track)
 
     private fun neuralQueueStatus(stage: String, examined: Int = 0, total: Int = 0,
-                                  priority: List<String> = emptyList(), committed: Boolean = false) {
+                                  priority: List<String> = emptyList(), committed: Boolean = false,
+                                  scores: Map<String, com.lastwave.app.playback.automix.neuralmix.CompatibilityScore> = emptyMap(),
+                                  bassTies: Map<String, Double> = emptyMap()) {
         val key = player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)
         // No per-tick list walk: snapshot positions only on a new queue/cycle or scan.
         val previous = _neuralQueueState.value
@@ -408,6 +410,7 @@ class MusicPlayer @Inject constructor(
         _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState(
             key, stage, examined, total, neuralOriginalPositions.toMap(), priority, committed,
             previewDepth = autoMixCoordinator.get().djPriorityLimit().coerceAtLeast(0),
+            scores = scores, bassTies = bassTies,
         )
     }
 
@@ -1165,6 +1168,9 @@ class MusicPlayer @Inject constructor(
             if (reason != Player.DISCONTINUITY_REASON_AUTO_TRANSITION) {
                 musicHapticsController.onPositionDiscontinuity()
             }
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && !autoMixCoordinator.get().isBlending) {
+                invalidateNeuralDjScan()
+            }
         }
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             musicHapticsController.onIsPlayingChanged(isPlaying, player.volume)
@@ -1220,12 +1226,8 @@ class MusicPlayer @Inject constructor(
                 swappingMediaId = null
                 return
             }
-            neuralDjJob?.cancel()
-            neuralDjJob = null
-            neuralDjAttempt = null
-            neuralDjLastDiagnostic = null
+            invalidateNeuralDjScan()
             neuralPinnedNextKey = null
-            _neuralQueueState.value = com.lastwave.app.playback.automix.neuralmix.NeuralQueueState()
             recordLocalListenSignal(reason)
             // Settle target or sanitize raw position from ExoPlayer
             val rawPos = player.currentPosition.coerceAtLeast(0L)
@@ -3847,6 +3849,7 @@ class MusicPlayer @Inject constructor(
 
 
     fun seekToQueueItem(index: Int) = onMain {
+        invalidateNeuralDjScan()
         if (isCasting) {
             val snapshot = _state.value
             if (index in snapshot.queue.indices) {
@@ -3875,6 +3878,7 @@ class MusicPlayer @Inject constructor(
         }
     }
     fun previous() = onMain {
+        invalidateNeuralDjScan()
         zeroVolumePlaybackObserver.onManualAction()
         if (isCasting) {
             if (_state.value.positionMs > 5_000) seekTo(0)
@@ -3938,6 +3942,7 @@ class MusicPlayer @Inject constructor(
     }
 
     fun next() = onMain {
+        invalidateNeuralDjScan()
         zeroVolumePlaybackObserver.onManualAction()
         if (isCasting) {
             seekToQueueItem(nextQueueIndex(_state.value))
@@ -5203,8 +5208,10 @@ class MusicPlayer @Inject constructor(
         if (key == neuralDjLastDiagnostic) return
         neuralDjLastDiagnostic = key
         Log.i("NeuralMixDJ", reason)
-        if (!_neuralQueueState.value.committed || _neuralQueueState.value.currentKey !=
-            player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) neuralQueueStatus(reason)
+        val snapshot = _neuralQueueState.value
+        if (snapshot.currentKey == player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey) && snapshot.committed) {
+            _neuralQueueState.value = snapshot.copy(stage = reason)
+        } else neuralQueueStatus(reason)
     }
 
     /** Main-thread snapshot; background resolution never changes the live queue. */
@@ -5248,12 +5255,23 @@ class MusicPlayer @Inject constructor(
         val duration = neuralDjDuration()
         val position = player.currentPosition
         if (neuralDjJob?.isActive == true) return
-        if (_neuralQueueState.value.committed && _neuralQueueState.value.stage != "Intelligent DJ disabled" && _neuralQueueState.value.currentKey ==
-            player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) return
+        if (_neuralQueueState.value.committed && neuralDjAttempt != null && _neuralQueueState.value.currentKey ==
+            player.currentMediaItem?.toPlayableTrack()?.let(::neuralSongKey)) {
+            val snapshotBeforeLock = _neuralQueueState.value
+            if (snapshotBeforeLock.stage == "Playback paused" && snapshotBeforeLock.priorityKeys.isNotEmpty()) {
+                _neuralQueueState.value = snapshotBeforeLock.copy(stage = "Queue prioritized · preparing transition")
+            }
+            if (duration > 0L && duration - position <= schedule.lockRemaining(duration) && _neuralQueueState.value.priorityKeys.isNotEmpty()) {
+                val snapshot = _neuralQueueState.value
+                if (snapshot.stage != "Next track locked · transition preparation")
+                    _neuralQueueState.value = snapshot.copy(stage = "Next track locked · transition preparation")
+            }
+            return
+        }
         if (!schedule.canPrepare(position, duration)) {
             neuralDjDiagnostic(when {
                 duration <= 0L -> "Waiting for reliable track duration"
-                position < duration / 4 -> "Waiting for analysis preparation window"
+                position < minOf(duration / 4, 20_000L) -> "Waiting for analysis preparation window"
                 else -> "Preparation deadline reached"
             })
             return
@@ -5290,7 +5308,10 @@ class MusicPlayer @Inject constructor(
         if (neuralDjAttempt == attempt) return
         // Intelligent DJ is explicitly enabled for the active queue, regardless of its origin.
         // Do not cross an unavailable/non-song boundary or move the current/played prefix.
-        val upcoming = (nextIndex until minOf(player.mediaItemCount, nextIndex + limit))
+        // Inspect a larger cached window, but freshly decode only the quality budget.
+        // This never inserts outside tracks or mutates the saved playlist.
+        val scanLimit = when (limit) { 3 -> 50; 5 -> 100; else -> 200 }
+        val upcoming = (nextIndex until minOf(player.mediaItemCount, nextIndex + scanLimit))
             .map(player::getMediaItemAt)
             .takeWhile { it.toPlayableTrack().mediaType == MediaType.SONG &&
                 (allQueues || neuralSongKey(it.toPlayableTrack()) in neuralRadioSongs) }
@@ -5299,7 +5320,9 @@ class MusicPlayer @Inject constructor(
             return
         }
         val keys = upcoming.map { neuralSongKey(it.toPlayableTrack()) }
-        val currentInput = autoMixAnalysisInput(current) ?: run {
+        val currentInput = autoMixAnalysisInput(current)
+        if (currentInput == null && coordinator.djAnalysisStatus(currentKey) != "available" &&
+            coordinator.djAnalysisStatus(currentKey, introOnly = true) != "available") {
             neuralDjDiagnostic("Current stream cannot be decoded for analysis")
             return
         }
@@ -5307,7 +5330,7 @@ class MusicPlayer @Inject constructor(
         val activeDeck = player
         val quality = selectedStreamingQuality(latestPlaybackSettings)
         val preferLossless = latestPlaybackSettings.preferLosslessStreaming
-        val budget = (duration - position - schedule.LOCK_REMAINING_MS - 5_000L).coerceAtMost(90_000L)
+        val budget = (duration - position - schedule.lockRemaining(duration) - 1_000L).coerceIn(1L, 90_000L)
         neuralQueueStatus("Analyzing current song outro", total = upcoming.size)
         Log.i("NeuralMixDJ", "Scanning ${upcoming.size} candidates for '${currentTrack.title}' at ${position}ms; duration=${duration}ms; budget=${budget}ms")
 
@@ -5337,28 +5360,67 @@ class MusicPlayer @Inject constructor(
         }
 
         neuralDjJob = applicationScope.launch(Dispatchers.Main.immediate) {
-            val scores = MutableList<Double?>(upcoming.size) { null }
+            val scores = MutableList<com.lastwave.app.playback.automix.neuralmix.CompatibilityScore?>(upcoming.size) { null }
             val analysedItems = arrayOfNulls<MediaItem>(upcoming.size)
             val resolvedStreams = arrayOfNulls<ResolvedStream>(upcoming.size)
-            val analysisInputs = arrayOfNulls<com.lastwave.app.playback.automix.analysis.AnalysisInput>(upcoming.size)
+            val tieScores = linkedMapOf<String, Double>()
+            val passportHints = MutableList<Double?>(upcoming.size) { null }
+            fun scoreSnapshot(): Map<String, com.lastwave.app.playback.automix.neuralmix.CompatibilityScore> =
+                scores.indices.mapNotNull { i -> scores[i]?.let { keys[i] to it } }.toMap()
+            fun status(stage: String, examined: Int) = neuralQueueStatus(stage, examined, upcoming.size, scores = scoreSnapshot())
             try {
                 withTimeoutOrNull(budget) {
-                    val outKey = coordinator.requestDjAnalysis(currentTrack, current, currentInput) ?: return@withTimeoutOrNull
-                    while (valid() && !coordinator.djAnalysisSettled(outKey)) delay(200L)
+                    val outKey = if (currentInput == null) currentKey else
+                        coordinator.requestDjAnalysis(currentTrack, current, currentInput) ?: return@withTimeoutOrNull
+                    while (currentInput != null && valid() && !coordinator.djAnalysisSettled(outKey)) delay(200L)
                     if (!valid()) return@withTimeoutOrNull
                     if (coordinator.djAnalysisStatus(outKey) != "available") {
-                        Log.i("NeuralMixDJ", "Outgoing analysis ${coordinator.djAnalysisStatus(outKey)}")
-                        return@withTimeoutOrNull
+                        Log.i("NeuralMixDJ", "Outgoing analysis ${coordinator.djAnalysisStatus(outKey)}; checking cached intro")
+                        if (coordinator.djAnalysisStatus(outKey, introOnly = true) != "available") return@withTimeoutOrNull
+                        status("Outgoing outro unavailable · comparing cached tempo/key", 0)
                     }
+                    // Read cached candidates first. No network or decode for this pass.
+                    // Prepared rendition is accepted only under the current quality policy.
                     for (i in upcoming.indices) {
                         if (!valid()) break
-                        neuralQueueStatus("Resolving and analyzing candidate ${i + 1}", i, upcoming.size)
+                        val item = player.getMediaItemAt(nextIndex + i)
+                        val track = item.toPlayableTrack()
+                        if (item.mediaId in unavailableMediaIds || keys[i] == neuralSongKey(currentTrack) || keys.indexOf(keys[i]) != i) continue
+                        val prepared = if (item.localConfiguration?.uri?.scheme == "lastwave") {
+                            findPreparedStreamFor(track, track.videoId, track.mediaIdKey() in losslessBypassMediaIds, quality)
+                                ?.takeIf { !it.isExpired() && it.segmentedDrm == null && it.mimeType.startsWith("audio/") &&
+                                    isStreamAllowedForQuality(it, quality, latestPlaybackSettings) }
+                        } else null
+                        val ready = prepared?.let { track.toMediaItem(it) } ?: item
+                        if (ready.localConfiguration?.uri?.scheme == "lastwave") {
+                            passportHints[i] = withContext(Dispatchers.IO) { coordinator.djRecordingHint(current, track) }
+                            continue
+                        }
+                        val cached = withContext(Dispatchers.IO) { coordinator.djCandidateScore(current, ready) }
+                        if (!valid()) break
+                        if (cached != null) {
+                            scores[i] = cached
+                            analysedItems[i] = ready
+                            resolvedStreams[i] = prepared
+                        } else {
+                            passportHints[i] = withContext(Dispatchers.IO) { coordinator.djRecordingHint(current, track) }
+                        }
+                    }
+                    status("Cached comparison · ${scores.count { it != null }} verified, ${passportHints.count { it != null }} hints", scores.count { it != null })
+                    var fresh = 0
+                    // Hints may select which streams to resolve first, never the final queue order.
+                    val freshOrder = upcoming.indices.sortedWith(compareByDescending<Int> { passportHints[it] ?: -1.0 }.thenBy { it })
+                    for (i in freshOrder) {
+                        if (!valid() || fresh >= limit) break
+                        if (scores[i] != null) continue
+                        status("Resolving candidate ${fresh + 1}/$limit", scores.count { it != null })
                         val item = player.getMediaItemAt(nextIndex + i)
                         val track = item.toPlayableTrack()
                         if (item.mediaId in unavailableMediaIds || keys[i] == neuralSongKey(currentTrack) || keys.indexOf(keys[i]) != i) {
                             Log.i("NeuralMixDJ", "Candidate ${i + 1}: unavailable or repeated song")
                             continue
                         }
+                        fresh++
                         val input = autoMixAnalysisInput(item)
                         var ready = item
                         var source = input
@@ -5420,42 +5482,29 @@ class MusicPlayer @Inject constructor(
                             Log.i("NeuralMixDJ", "Candidate ${i + 1}: unsupported or unresolved input")
                             continue
                         }
-                        analysisInputs[i] = source
+                        status("Analyzing candidate $fresh/$limit", scores.count { it != null })
                         val key = coordinator.requestDjAnalysis(track, ready, source, introOnly = true) ?: break
                         // One decode at a time; a per-candidate limit prevents a bad stream
                         // monopolizing the whole scheduler. A partial scan may still win.
-                        withTimeoutOrNull(34_000L) {
+                        withTimeoutOrNull(18_000L) {
                             while (valid() && !coordinator.djAnalysisSettled(key, introOnly = true)) delay(200L)
                         }
                         if (!valid()) break
-                        scores[i] = coordinator.djCandidateScore(current, ready, duration)
+                        scores[i] = withContext(Dispatchers.IO) { coordinator.djCandidateScore(current, ready) }
                         analysedItems[i] = ready
                         Log.i("NeuralMixDJ", "Candidate ${i + 1}: ${coordinator.djAnalysisStatus(key, introOnly = true)}, rank=${scores[i]}")
-                        neuralQueueStatus("Candidate analysis", i + 1, upcoming.size)
+                        if (!valid()) break
+                        status("Candidate analysis · ${scores.count { it != null }} scored", scores.count { it != null })
                         if (!coordinator.djAnalysisSettled(key, introOnly = true)) break // don't queue more work behind a stalled decode
                     }
-                    // Intro scans are cheap; only extend a few promising candidates to full
-                    // signatures, reusing their intros, when time remains for a real chain.
-                    val promising = scores.indices.filter { (scores[it] ?: 0.0) >= 40.0 }
-                        .sortedByDescending { scores[it] }.take((depth - 1).coerceAtLeast(0))
-                    for (i in promising) {
-                        if (!valid() || duration - player.currentPosition < schedule.LOCK_REMAINING_MS + 35_000L) break
-                        val ready = analysedItems[i] ?: continue
-                        val source = analysisInputs[i] ?: continue
-                        neuralQueueStatus("Analyzing candidate outros for sequence", scores.count { it != null }, upcoming.size)
-                        val key = coordinator.requestDjAnalysis(ready.toPlayableTrack(), ready, source) ?: break
-                        withTimeoutOrNull(18_000L) {
-                            while (valid() && !coordinator.djAnalysisSettled(key)) delay(200L)
-                        }
-                        if (!coordinator.djAnalysisSettled(key)) break
-                    }
+
                 }
                 Log.i("NeuralMixDJ", "Scan results: $scores")
                 if (!valid()) {
                     neuralDjDiagnostic("Scan discarded: queue, playback, rendition or deadline changed")
                     return@launch
                 }
-                neuralQueueStatus("Ranking candidates · ${scores.count { it != null }} scored", scores.count { it != null }, upcoming.size)
+                status("Ranking candidates · ${scores.count { it != null }} scored", scores.count { it != null })
                 // A quick cached scan may finish early. Defer its result until the midpoint.
                 while (valid() && !schedule.canCommit(player.currentPosition, neuralDjDuration())) delay(200L)
                 if (!valid() || !schedule.canCommit(player.currentPosition, neuralDjDuration())) {
@@ -5474,35 +5523,52 @@ class MusicPlayer @Inject constructor(
                         continue
                     }
                     if (keyOf(live) != keyOf(ready) && live.localConfiguration?.uri?.scheme != "lastwave") {
-                        scores[i] = coordinator.djCandidateScore(current, live, duration)
+                        scores[i] = withContext(Dispatchers.IO) { coordinator.djCandidateScore(current, live) }
+                        if (!valid()) return@launch
                         analysedItems[i] = live
                         resolvedStreams[i] = null
                     }
                 }
                 val optimizer = com.lastwave.app.playback.automix.neuralmix.NeuralQueueOptimizer
-                val chain = optimizer.chain(scores, depth = depth) { from, to ->
-                    val a = analysedItems[from]
-                    val b = analysedItems[to]
-                    if (a == null || b == null || keys[from] == keys[to]) null else coordinator.djSequenceScore(a, b)
-                }
-                if (chain.isEmpty()) {
-                    neuralQueueStatus("No reliable match · keeping queue order", scores.count { it != null }, upcoming.size, committed = true)
-                    Log.i("NeuralMixDJ", "No sufficiently compatible analysed candidate; keeping queue order")
-                    return@launch
-                }
-                val winner = chain.first()
-                val index = nextIndex + winner
-                val ready = analysedItems[winner] ?: return@launch
-                val live = player.getMediaItemAt(index)
-                val resolved = resolvedStreams[winner]
-                if (keyOf(live) != keyOf(ready)) {
-                    if (resolved == null || resolved.isExpired() || live.localConfiguration?.uri?.scheme != "lastwave" ||
-                        publishNextPreparedStream(index, live.mediaId, resolved) == null ||
-                        keyOf(player.getMediaItemAt(index)) != keyOf(ready)) {
-                        neuralDjDiagnostic("Selected stream changed; keeping queue order")
-                        return@launch
+                val ranks = scores.map { it?.score }
+                status("Ranking measured scores · bass only for ties", scores.count { it != null })
+                // Cache reads and bass-envelope comparison happen off the playback thread.
+                val priority = withContext(Dispatchers.IO) {
+                    optimizer.prioritize(ranks) { i ->
+                        analysedItems[i]?.let { coordinator.djBassTie(current, it) }
+                            ?.also { tieScores[keys[i]] = it }
                     }
                 }
+                if (!valid()) return@launch
+                if (priority.isEmpty()) {
+                    neuralQueueStatus("No acoustic evidence · keeping queue order", total = upcoming.size, committed = true)
+                    return@launch
+                }
+                // No musical rejection. A failed/expired rendition is a technical
+                // constraint; try the next measured candidate and preserve all tracks.
+                var winner: Int? = null
+                for (candidate in priority) {
+                    if (!valid()) return@launch
+                    val ready = analysedItems[candidate] ?: continue
+                    val index = nextIndex + candidate
+                    val live = player.getMediaItemAt(index)
+                    val resolved = resolvedStreams[candidate]
+                    if (keyOf(live) != keyOf(ready)) {
+                        if (resolved == null || resolved.isExpired() || live.localConfiguration?.uri?.scheme != "lastwave" ||
+                            publishNextPreparedStream(index, live.mediaId, resolved) == null ||
+                            keyOf(player.getMediaItemAt(index)) != keyOf(ready)) {
+                            scores[candidate] = null
+                            continue
+                        }
+                    }
+                    winner = candidate
+                    break
+                }
+                val selected = winner ?: run {
+                    neuralQueueStatus("No playable analysed rendition · keeping queue order", scores.count { it != null }, upcoming.size, committed = true, scores = scoreSnapshot())
+                    return@launch
+                }
+                val chain = priority.filter { scores[it] != null }.let { listOf(selected) + it.filterNot { i -> i == selected } }
                 if (!valid()) {
                     neuralDjDiagnostic("Queue changed while preparing selected stream")
                     return@launch
@@ -5522,8 +5588,9 @@ class MusicPlayer @Inject constructor(
                     persistPlaybackSession()
                     preloadNextQueueItem(currentIndex)
                 }
-                neuralQueueStatus(if (moves.isEmpty()) "Best sequence already next" else "Queue optimized · preparing transition",
-                    scores.count { it != null }, upcoming.size, chain.map { keys[it] }, committed = true)
+                neuralQueueStatus(if (moves.isEmpty()) "Best available track already next" else "Queue prioritized · preparing transition",
+                    scores.count { it != null }, upcoming.size, chain.take(depth).map { keys[it] }, committed = true,
+                    scores = scoreSnapshot(), bassTies = tieScores.toMap())
                 Log.i("NeuralMixDJ", "Committed priority sequence $chain; scores=$scores; moves=$moves")
             } catch (cancelled: CancellationException) {
                 throw cancelled

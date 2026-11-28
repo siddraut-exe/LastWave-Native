@@ -7,6 +7,7 @@ import kotlin.math.exp
 /** Everything AutoMix hooks into one deck's processed float output. */
 class DeckTaps {
     val eq = DeckEqStage()
+    val echo = NeuralEchoStage()
     val kicks = KickTap()
     val level = LevelMeter()
 }

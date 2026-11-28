@@ -21,6 +21,7 @@ import com.lastwave.app.playback.automix.engine.TransitionPlanner
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
@@ -129,32 +130,43 @@ class TransitionPlannerTest {
     }
 
     @Test
-    fun neuralMixRequiresEvidenceAndReportsFallbackReason() {
+    fun neuralMixUsesPrimaryEvidenceWithoutFingerprintButRequiresLiveBeatConfidence() {
         val settings = AutoMixSettings(neuralMixEnabled = true)
-        val missing = plan(outSig(beatOutro), inSig(beatIntro), settings) as MixPlan
-        assertFalse(missing.beatLocked)
-        assertNull(missing.neuralScore)
-        assertEquals("No reliable outro beat pattern", missing.neuralReason)
-        val rhythm = List(16) { if (it % 4 == 0) 1.0 else 0.1 }
-        val fingerprint = com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint(rhythm, rhythm, rhythm, 0.3, 124.0)
-        val out = outSig(beatOutro).copy(outroRhythm = fingerprint)
-        val inc = inSig(beatIntro).copy(introRhythm = fingerprint.copy(bpm = 126.0))
+        val out = outSig(beatOutro.copy(camelotKey = "8A", keyConfidence = 0.9f))
+        val inc = inSig(beatIntro.copy(camelotKey = "8A", keyConfidence = 0.9f))
         val compatible = plan(out, inc, settings) as MixPlan
         assertTrue(compatible.beatLocked)
-        assertTrue(requireNotNull(compatible.neuralScore).score > 80.0)
-        val farTempo = inc.copy(intro = beatIntro.copy(grid = beatIntro.grid!!.copy(bpm = 170f)), introRhythm = fingerprint.copy(bpm = 170.0))
-        assertFalse((plan(out, farTempo, settings) as MixPlan).beatLocked)
+        assertEquals(MixShape.EQUAL_POWER, compatible.shape)
+        assertEquals(100.0, requireNotNull(compatible.neuralScore).score, 1e-9)
+        val weak = inc.copy(intro = inc.intro!!.copy(grid = inc.intro.grid!!.copy(confidence = 0.4f)))
+        val fallback = plan(out, weak, settings) as MixPlan
+        assertFalse(fallback.beatLocked)
+        assertEquals(100.0, requireNotNull(fallback.neuralScore).score, 1e-9)
+        val far = inc.copy(intro = inc.intro.copy(grid = inc.intro.grid!!.copy(bpm = 170f)))
+        assertEquals(MixShape.ECHO_OUT, (plan(out, far, settings) as MixPlan).shape)
     }
 
     @Test
     fun neuralMixLimitsUncertainBarPhaseToShortPhrase() {
-        val rhythm = List(16) { if (it % 4 == 0) 1.0 else 0.1 }
-        val fingerprint = com.lastwave.app.playback.automix.neuralmix.RhythmFingerprint(rhythm, rhythm, rhythm, 0.3, 124.0)
-        val out = outSig(beatOutro.copy(grid = beatOutro.grid!!.copy(barConfidence = 0.1f))).copy(outroRhythm = fingerprint)
-        val inc = inSig(beatIntro).copy(introRhythm = fingerprint.copy(bpm = 126.0))
+        val out = outSig(beatOutro.copy(grid = beatOutro.grid!!.copy(barConfidence = 0.1f)))
+        val inc = inSig(beatIntro)
         val decision = plan(out, inc, AutoMixSettings(neuralMixEnabled = true)) as MixPlan
         assertTrue(decision.beatLocked)
-        assertEquals(4, decision.bars)
+        assertTrue(requireNotNull(decision.bars) <= 2)
+    }
+
+    @Test
+    fun neuralMixClashUsesActualBassOrFilter() {
+        val settings = AutoMixSettings(neuralMixEnabled = true)
+        val out = outSig(beatOutro.copy(camelotKey = "8A", keyConfidence = 0.9f))
+        val inc = inSig(beatIntro.copy(camelotKey = "2B", keyConfidence = 0.9f))
+        val swap = plan(out, inc, settings) as MixPlan
+        assertEquals(MixShape.BASS_SWAP, swap.shape)
+        assertNotNull(swap.bassSwapAtMs)
+        val weak = inc.copy(intro = inc.intro!!.copy(grid = inc.intro.grid!!.copy(confidence = 0.4f)))
+        val filter = plan(out, weak, settings) as MixPlan
+        assertEquals(MixShape.FILTER_FADE, filter.shape)
+        assertFalse(filter.beatLocked)
     }
 
     @Test

@@ -111,20 +111,15 @@ object TransitionPlanner {
             input.incomingSignature?.let { incoming -> SignatureCompatibility.compare(out, incoming) }
         } else null
         val confidentBars = (outro?.grid?.barConfidence ?: 0f) >= 0.5f && (intro?.grid?.barConfidence ?: 0f) >= 0.5f
-        val maxBars = if (neural) NeuralMixTransitionPolicy.maxBars(compatibility).coerceAtMost(if (confidentBars) 16 else 4) else 16
+        val maxBars = if (neural) NeuralMixTransitionPolicy.maxBars(compatibility).coerceAtMost(if (confidentBars) 8 else 2) else 16
         val result = (if (maxBars > 0) beatmix(input, outro, intro, outEnd, inStart, maxBars) else null)
             ?: fade(input, outro, intro, outEnd, inStart)
         val reason = when {
-            input.outgoingSignature == null -> "Outgoing audio analysis unavailable"
-            input.incomingSignature == null -> "Incoming audio analysis unavailable"
-            input.outgoingSignature.outroRhythm == null -> "No reliable outro beat pattern"
-            input.incomingSignature.introRhythm == null -> "No reliable intro beat pattern"
-            compatibility?.components?.get("rhythm") == null -> "Insufficient rhythmic variation"
-            maxBars == 0 -> "Low compatibility or evidence"
-            result is MixPlan && !result.beatLocked -> "Beat-lock constraints not met"
-            else -> "Beat-aligned transition"
+            compatibility == null -> "Acoustic evidence unavailable"
+            result is MixPlan && !result.beatLocked -> "Independent beat-lock checks did not approve a synchronized blend"
+            else -> "Beat and phrase aligned"
         }
-        return if (neural && result is MixPlan) result.copy(neuralScore = compatibility?.takeIf { it.components.containsKey("rhythm") }, neuralMode = true, neuralReason = reason) else result
+        return if (neural && result is MixPlan) result.copy(neuralScore = compatibility, neuralMode = true, neuralReason = reason) else result
     }
 
     /** The next track of the same album: the artist sequenced that join, keep it. */
@@ -145,22 +140,24 @@ object TransitionPlanner {
     ): MixPlan? {
         // Tempo matching changes the speed; never fight a user-chosen speed or pitch.
         if (input.userSpeed != 1f || input.userPitch != 1f || outro == null || intro == null) return null
-        val outGrid = outro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE } ?: return null
-        val inGrid = intro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE } ?: return null
+        val outGrid = outro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE && it.bpm.isFinite() && it.bpm > 0 && it.downbeatMs.isFinite() } ?: return null
+        val inGrid = intro.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE && it.bpm.isFinite() && it.bpm > 0 && it.downbeatMs.isFinite() } ?: return null
         val ratio = tempoRatio(outGrid, inGrid, input.settings.neuralMixEnabled) ?: return null
         val keys = keyPair(outro, intro)
         val clash = keys?.let {
             AutoMixCamelotClassifier.evaluateCompatibility(it.first, it.second).tier == HarmonicCompatibilityTier.DISSONANT
         } == true
+        if (input.settings.neuralMixEnabled && clash && !input.settings.neuralBass) return null
         val barMs = outGrid.barMs
         val preferred = when (input.settings.durationMode) {
             TransitionDurationMode.AUTO -> if (8 * barMs <= AUTO_BEATMIX_MAX_MS) 8 else 4
             TransitionDurationMode.MANUAL -> listOf(4, 8, 16).minBy { abs(it * barMs - input.settings.targetDurationSeconds * 1000.0) }
         }
-        val swapEnabled = if (input.settings.neuralMixEnabled) input.settings.neuralBass else input.settings.spectralFilterSweepsEnabled
+        val swapEnabled = if (input.settings.neuralMixEnabled) input.settings.neuralBass && clash else input.settings.spectralFilterSweepsEnabled
         val shape = if (swapEnabled) MixShape.BASS_SWAP else MixShape.EQUAL_POWER
         // Clashing keys get the shortest phrase so the two harmonies barely meet.
-        val best = listOf(16, 8, 4).filter { it <= minOf(maxBars, if (clash) 4 else preferred) }.flatMap { bars ->
+        val lengths = if (input.settings.neuralMixEnabled) listOf(8, 4, 2, 1) else listOf(16, 8, 4)
+        val best = lengths.filter { it <= minOf(maxBars, if (clash) 4 else preferred) }.flatMap { bars ->
             val overlap = bars * barMs
             val latest = outGrid.downbeatAtOrBefore(outEnd - overlap)
             val cueOuts = (0..MAX_PHRASE_SEARCH_BARS).map { latest - it * barMs }
@@ -176,7 +173,8 @@ object TransitionPlanner {
             ?.takeIf { (input.settings.neuralMixEnabled && !input.settings.neuralVocals) || it.second.clashMs <= MAX_BEATMIX_CLASH_MS }
             ?: return null
         val (chosen, verdict) = best
-        val swapAt = if (swapEnabled) (chosen.cueOut + chosen.bars / 2 * barMs).roundToLong() else null
+        // Never schedule a bass handoff between beats for a one-bar blend.
+        val swapAt = if (swapEnabled) (chosen.cueOut + chosen.bars * 2 * outGrid.beatMs).roundToLong() else null
         return MixPlan(
             cueOutMs = chosen.cueOut.roundToLong(),
             cueInMs = chosen.cueIn.roundToLong(),
@@ -241,13 +239,7 @@ object TransitionPlanner {
             candidate.cueOut, candidate.cueIn, candidate.overlap, ratio, shape,
         )
         val protect = !input.settings.neuralMixEnabled || input.settings.neuralVocals
-        val localRhythm = if (input.settings.neuralMixEnabled) {
-            com.lastwave.app.playback.automix.neuralmix.CueRhythm.compare(
-                outro.bands, outro.startMs, candidate.cueOut,
-                intro.bands, intro.startMs, candidate.cueIn, ratio.toDouble(), candidate.overlap,
-            ) ?: 0.0
-        } else 0.0
-        val total = 3.0 * localRhythm + sectionAtStart.coerceAtMost(PHRASE_SCORE_CAP) +
+        val total = sectionAtStart.coerceAtMost(PHRASE_SCORE_CAP) +
             dropAtEnd.coerceAtMost(PHRASE_SCORE_CAP) -
             candidate.barsBack * LOST_BAR_COST -
             (preferredBars / candidate.bars - 1) * SHORTER_PHRASE_COST -
@@ -310,18 +302,38 @@ object TransitionPlanner {
             else -> overlap >= 6_000L
         }
         if (swap && shape == MixShape.EQUAL_POWER) shape = MixShape.BASS_SWAP
+        // Select an actual supported effect by factor evidence, not the aggregate score.
+        if (input.settings.neuralMixEnabled) {
+            val evidence = outSig?.let { a -> inSig?.let { b -> SignatureCompatibility.compare(a, b) } }
+            val tempo = evidence?.components?.get("tempo")
+            val harmony = evidence?.components?.get("harmonic")
+            val outgoingGrid = outro?.grid?.takeIf { it.confidence >= MIN_BEAT_CONFIDENCE && it.bpm.isFinite() && it.bpm > 0 }
+            shape = when {
+                tempo != null && tempo < 0.5 && outgoingGrid != null && overlap >= 1_500L -> MixShape.ECHO_OUT
+                harmony != null && harmony < 0.9 && overlap >= 1_500L && input.settings.neuralBass -> MixShape.FILTER_FADE
+                else -> if (shape == MixShape.HOLD_OUTGOING) shape else MixShape.EQUAL_POWER
+            }
+            if (shape == MixShape.ECHO_OUT) {
+                // Echo duration uses a trusted outgoing beat, not incoming tempo.
+                val echoLength = (4 * outgoingGrid!!.beatMs).roundToLong().coerceIn(1_500L, 4_000L)
+                overlap = minOf(overlap, echoLength)
+                cueOut = outEnd - overlap
+            }
+        }
+        val doSwap = if (input.settings.neuralMixEnabled) shape == MixShape.FILTER_FADE else swap
         return MixPlan(
             cueOutMs = cueOut,
             cueInMs = inStart,
             overlapMs = overlap,
             shape = shape,
-            style = if (swap) TransitionStyle.SPECTRAL_SWEEP else TransitionStyle.PERCEPTUAL_FADE,
+            style = if (doSwap) TransitionStyle.SPECTRAL_SWEEP else TransitionStyle.PERCEPTUAL_FADE,
             bassSwapAtMs = when {
-                !swap -> null
+                !doSwap || shape == MixShape.FILTER_FADE -> null
                 shape == MixShape.BASS_SWAP -> cueOut + overlap / 2
                 else -> cueOut + overlap
             },
             bassSwapRampMs = if (shape == MixShape.BASS_SWAP) 1_500L else 250L,
+            bpm = if (shape == MixShape.ECHO_OUT) outro?.grid?.bpm else null,
             keyPair = keyPair(outro, intro)?.let { "${it.first} → ${it.second}" },
             vocalSafe = !(outVocals == true && inVocals == true) && outVocals != null && inVocals != null,
         )

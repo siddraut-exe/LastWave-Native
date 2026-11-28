@@ -372,10 +372,11 @@ internal fun QueuePanel(
 
     // Stable keys so animateItem() can animate moves instead of treating
     // every shifted row as a new item. Duplicates get occurrence suffixes.
-    val queueKeys = remember(state.queue) {
+    val queueKeys = remember(state.queue, neuralMode) {
         val counts = mutableMapOf<String, Int>()
-        state.queue.map { item ->
-            val base = item.videoId ?: item.playbackUrl
+        state.queue.mapIndexed { index, item ->
+            val neuralKey = neuralKeys[index]
+            val base = if (neuralMode && neuralKey !in duplicateNeuralKeys) "neural:$neuralKey" else item.videoId ?: item.playbackUrl
                 ?: "${item.artist}|${item.title}|${item.album}"
             val n = counts.getOrDefault(base, 0)
             counts[base] = n + 1
@@ -637,6 +638,10 @@ internal fun QueuePanel(
                 val position = groupPositionFor(index, state.queue.size)
                 val inNeuralGroup = neuralMode && index in state.currentIndex..neuralEnd
                 val firstNeural = inNeuralGroup && isCurrent
+                val neuralScore = if (neuralStateMatches && neuralKeys[index] !in duplicateNeuralKeys) neuralQueue.scores[neuralKeys[index]] else null
+                val verifiedNext = inNeuralGroup && !isCurrent && neuralStateMatches && neuralQueue.committed &&
+                    index == state.currentIndex + 1 && neuralQueue.priorityKeys.firstOrNull() == neuralKeys[index]
+                val originalPosition = if (neuralStateMatches && neuralKeys[index] !in duplicateNeuralKeys) neuralQueue.originalPositions[neuralKeys[index]] else null
                 val itemShape = if (inNeuralGroup) RoundedCornerShape(12.dp) else groupShape(position)
 
                 val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
@@ -702,7 +707,7 @@ internal fun QueuePanel(
                             Text(neuralStatus, style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                             if (neuralStateMatches && neuralQueue.committed && neuralPriorityCount > 0) Text(
-                                "$neuralPriorityCount planned upcoming match${if (neuralPriorityCount == 1) "" else "es"}",
+                                "$neuralPriorityCount ranked upcoming track${if (neuralPriorityCount == 1) "" else "s"} · lower scores retained",
                                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
                             ) else if (neuralPriorityCount > 0) Text(
                                 "Candidate preview · order not yet verified",
@@ -738,16 +743,22 @@ internal fun QueuePanel(
                                 glassModifier = Modifier.liquidGlassChrome(itemShape, LocalLiquidGlass.current),
                                 onClick = { player.seekToQueueItem(currentQueueKeys.indexOf(stableKey).takeIf { it >= 0 } ?: currentIndex) },
                                 shape = itemShape,
-                                color = if (isCurrent) {
+                                color = if (verifiedNext) {
+                                    MaterialTheme.colorScheme.tertiaryContainer
+                                } else if (isCurrent) {
                                     if (LocalLiquidGlass.current) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f)
                                     else MaterialTheme.colorScheme.primaryContainer
                                 } else {
                                     if (LocalLiquidGlass.current) MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.70f)
                                     else MaterialTheme.colorScheme.surfaceContainerHighest
                                 },
-                                contentColor = if (isCurrent) MaterialTheme.colorScheme.onPrimaryContainer
+                                contentColor = if (verifiedNext) MaterialTheme.colorScheme.onTertiaryContainer
+                                else if (isCurrent) MaterialTheme.colorScheme.onPrimaryContainer
                                 else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier.fillMaxWidth().then(if (inNeuralGroup) Modifier.border(
+                                    if (verifiedNext) 2.dp else 1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = if (verifiedNext) 0.95f else 0.25f), itemShape,
+                                ) else Modifier),
                             ) {
                                 Row(
                                     Modifier.fillMaxWidth().padding(9.dp),
@@ -780,13 +791,20 @@ internal fun QueuePanel(
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                         )
-                                        if (inNeuralGroup && !isCurrent) Text(
-                                            if (neuralStateMatches && neuralQueue.committed) {
-                                                if (index == state.currentIndex + 1) "Next match" else "Planned ${index - state.currentIndex}"
-                                            } else "Candidate",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                        )
+                                        if (neuralMode && !isCurrent && index > state.currentIndex && (inNeuralGroup || neuralScore != null)) {
+                                            val label = if (verifiedNext) "NEXT · Priority 1" else if (neuralStateMatches && neuralQueue.committed && neuralScore != null) "Priority ${index - state.currentIndex}" else "Candidate"
+                                            val moved = originalPosition?.let { it - (index + 1) } ?: 0
+                                            val movement = if (neuralQueue.committed && moved != 0) " · ${if (moved > 0) "↑" else "↓"}${kotlin.math.abs(moved)}" else ""
+                                            Text(label + movement, style = MaterialTheme.typography.labelSmall,
+                                                color = if (verifiedNext) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.primary,
+                                                fontWeight = if (verifiedNext) FontWeight.Bold else FontWeight.Medium)
+                                            Text(neuralScore?.let { "${"%.1f".format(it.score)}% · evidence ${(it.coverage * 100).roundToInt()}%" +
+                                                (neuralQueue.bassTies[neuralKeys[index]]?.let { bass -> " · Bass ${(bass * 100).roundToInt()}%" } ?: "") } ?: "Awaiting analysis",
+                                                style = MaterialTheme.typography.labelSmall, color = if (verifiedNext) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                                            if (neuralScore != null) Box(Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(3.dp)).background(MaterialTheme.colorScheme.outlineVariant)) {
+                                                Box(Modifier.fillMaxWidth((neuralScore.score / 100.0).toFloat().coerceIn(0f, 1f)).height(3.dp).background(MaterialTheme.colorScheme.primary))
+                                            }
+                                        }
                                     }
                                     IconButton(
                                         onClick = { menuIndex = currentQueueKeys.indexOf(stableKey).takeIf { it >= 0 } ?: currentIndex },
